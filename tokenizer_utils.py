@@ -131,7 +131,23 @@ class BPETokenizer:
                         merges.append((t1, t2))
 
         return cls(vocab, merges, special_tokens)
-    
+
+    def to_file(self, vocab_filepath: str, merges_filepath: str):
+        byte_to_unicode = self._bytes_to_unicode()
+
+        with open(vocab_filepath, 'w', encoding='utf-8') as f:
+            serialized = {
+                ''.join(byte_to_unicode[b] for b in token_bytes): token_id
+                for token_id, token_bytes in self.vocabs.items()
+            }
+            json.dump(serialized, f, ensure_ascii=False)
+
+        with open(merges_filepath, 'w', encoding='utf-8') as f:
+            for t1, t2 in self.merges:
+                s1 = ''.join(byte_to_unicode[b] for b in t1)
+                s2 = ''.join(byte_to_unicode[b] for b in t2)
+                f.write(f'{s1} {s2}\n')
+
     def _pre_tokenize_chunk(self, chunk_text):
         counts = defaultdict(int)
         # 先按 special tokens 切分，保证 special token 不被拆开
