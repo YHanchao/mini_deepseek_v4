@@ -221,19 +221,21 @@ class MiniLLM(nn.Module):
         self.rope = RotaryPositionalEmbedding(
             rope_theta, d_k, context_length, device=device
         )
-        self.transformers = nn.ModuleList([
-            TransformerBlock(
-                d_model=d_model,
-                d_ff=d_ff,
-                num_heads=num_heads,
-                max_seq_len=context_length,
-                rope=self.rope,
-                eps=1e-5,
-                device=device,
-                dtype=dtype,
-            )
-            for _ in range(num_layers)
-        ])
+        self.transformers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    num_heads=num_heads,
+                    max_seq_len=context_length,
+                    rope=self.rope,
+                    eps=1e-5,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.rms_norm = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
         self.output_linear = Linear(d_model, vocab_size, device=device, dtype=dtype)
 

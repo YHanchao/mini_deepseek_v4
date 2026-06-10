@@ -152,6 +152,16 @@ PythonProject/tools/
 PythonProject/v1/
 PythonProject/v2/
 PythonProject/test/test_results
+
+# IDE
 .vscode/
 .idea/
+
+# Project-specific
 tests/
+data/
+checkpoints/*
+!checkpoints/.gitkeep
+.claude/
+.vscode/
+.idea/
