@@ -10,6 +10,7 @@ from collections import defaultdict
 import regex as re
 import json
 
+
 # This function is directly copied from CS336
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -20,7 +21,9 @@ def find_chunk_boundaries(
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
     """
-    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+    assert isinstance(
+        split_special_token, bytes
+    ), "Must represent special token as a bytestring"
 
     # Get total file size in bytes
     file.seek(0, os.SEEK_END)
@@ -57,16 +60,21 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+
 class BPETokenizer:
     # GPT-2 预分词正则，直接写死
-    PRETOKENIZE_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    PRETOKENIZE_PATTERN = (
+        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
 
     @staticmethod
     def _bytes_to_unicode() -> dict[int, str]:
         """byte → printable unicode 的映射，与 GPT-2 一致"""
-        bs = (list(range(ord("!"), ord("~") + 1))
-              + list(range(ord("¡"), ord("¬") + 1))
-              + list(range(ord("®"), ord("ÿ") + 1)))
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
         cs = bs[:]
         n = 0
         for b in range(2**8):
@@ -76,24 +84,32 @@ class BPETokenizer:
                 n += 1
         return dict(zip(bs, [chr(c) for c in cs]))
 
-    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]],
-                 special_tokens: list[str] | None = None):
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
         self.vocabs = dict(vocab)
+        self.vocab_size = len(vocab)
         self.merges = list(merges) if merges else []
         self.byte_to_id = {v: k for k, v in self.vocabs.items()}
 
         if special_tokens:
-            self.special_tokens = [t.encode('utf-8') for t in special_tokens]
+            self.special_tokens = [t.encode("utf-8") for t in special_tokens]
         else:
             self.special_tokens = []
 
         # 预编译正则和 special token 查找结构
         self._compiled_regex = re.compile(self.PRETOKENIZE_PATTERN)
-        self._special_token_strs = {t.decode('utf-8') for t in self.special_tokens}
+        self._special_token_strs = {t.decode("utf-8") for t in self.special_tokens}
         if self.special_tokens:
             # 按长度降序排列，保证更长的 special token 优先匹配（如 <|endoftext|><|endoftext|> 优先于 <|endoftext|>）
-            escaped = '|'.join(re.escape(t.decode('utf-8')) for t in sorted(self.special_tokens, key=lambda x: -len(x)))
-            self._special_split_re = re.compile(f'({escaped})')
+            escaped = "|".join(
+                re.escape(t.decode("utf-8"))
+                for t in sorted(self.special_tokens, key=lambda x: -len(x))
+            )
+            self._special_split_re = re.compile(f"({escaped})")
         else:
             self._special_split_re = None
         self._special_token_to_id = {}
@@ -107,8 +123,12 @@ class BPETokenizer:
         self._merge_rank = {pair: i for i, pair in enumerate(self.merges)}
 
     @classmethod
-    def from_file(cls, vocab_filepath: str, merges_filepath: str,
-                  special_tokens: list[str] | None = None):
+    def from_file(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ):
         byte_decoder = {v: k for k, v in cls._bytes_to_unicode().items()}
 
         with open(vocab_filepath) as f:
@@ -135,18 +155,18 @@ class BPETokenizer:
     def to_file(self, vocab_filepath: str, merges_filepath: str):
         byte_to_unicode = self._bytes_to_unicode()
 
-        with open(vocab_filepath, 'w', encoding='utf-8') as f:
+        with open(vocab_filepath, "w", encoding="utf-8") as f:
             serialized = {
-                ''.join(byte_to_unicode[b] for b in token_bytes): token_id
+                "".join(byte_to_unicode[b] for b in token_bytes): token_id
                 for token_id, token_bytes in self.vocabs.items()
             }
             json.dump(serialized, f, ensure_ascii=False)
 
-        with open(merges_filepath, 'w', encoding='utf-8') as f:
+        with open(merges_filepath, "w", encoding="utf-8") as f:
             for t1, t2 in self.merges:
-                s1 = ''.join(byte_to_unicode[b] for b in t1)
-                s2 = ''.join(byte_to_unicode[b] for b in t2)
-                f.write(f'{s1} {s2}\n')
+                s1 = "".join(byte_to_unicode[b] for b in t1)
+                s2 = "".join(byte_to_unicode[b] for b in t2)
+                f.write(f"{s1} {s2}\n")
 
     def _pre_tokenize_chunk(self, chunk_text):
         counts = defaultdict(int)
@@ -185,7 +205,7 @@ class BPETokenizer:
 
     def pre_tokenize(self, fname):
         # 每个chunk比方说只占用50MB
-        with open(fname, 'rb') as f:
+        with open(fname, "rb") as f:
             f.seek(0, os.SEEK_END)
             file_size = f.tell()
             f.seek(0)
@@ -203,7 +223,6 @@ class BPETokenizer:
                 open(fname, "rb").read().decode("utf-8", errors="ignore")
             )
             return total_counts
-        
 
         # 多进程并行处理
         task_queue = mp.Queue()
@@ -211,7 +230,9 @@ class BPETokenizer:
 
         workers = []
         for _ in range(num_workers):
-            w = mp.Process(target=self._pre_tokenize_worker, args=(task_queue, result_queue))
+            w = mp.Process(
+                target=self._pre_tokenize_worker, args=(task_queue, result_queue)
+            )
             w.start()
             workers.append(w)
 
@@ -236,31 +257,31 @@ class BPETokenizer:
             w.join()
 
         return total_counts
-    
+
     def create_index(self, pre_tokenize_counts):
         # 构建一个索引，后面BPE合并的时候基于索引去做，而不是遍历查询字符串
         word_registry: dict[int, dict] = {}  # word: (seq, freq)
         pair_to_words: dict[tuple, set] = {}  # pair: {(word, pos_in_word)}
-        pair_freq: dict[tuple, int] = {}      # pair: freq
+        pair_freq: dict[tuple, int] = {}  # pair: freq
         next_word_id = 0
 
         for word, freq in pre_tokenize_counts.items():
-            word_bytes = word.encode('utf-8')
+            word_bytes = word.encode("utf-8")
             word_id = next_word_id
             next_word_id += 1
 
             # 如果这个词是 special token，作为一个原子 token 存储，不参与 pair 统计
             if word_bytes in self._special_token_to_id:
                 token_id = self._special_token_to_id[word_bytes]
-                word_registry[word_id] = {'seq': (token_id,), 'freq': freq}
+                word_registry[word_id] = {"seq": (token_id,), "freq": freq}
                 continue
 
             byte_seq = tuple(word_bytes)
-            word_registry[word_id] = {'seq': byte_seq, 'freq': freq}
+            word_registry[word_id] = {"seq": byte_seq, "freq": freq}
 
             # 记录这个词中的所有pair
             for pos in range(len(byte_seq) - 1):
-                pair = (byte_seq[pos], byte_seq[pos+1])
+                pair = (byte_seq[pos], byte_seq[pos + 1])
 
                 pair_freq[pair] = pair_freq.get(pair, 0) + freq
 
@@ -270,7 +291,12 @@ class BPETokenizer:
 
         return word_registry, pair_to_words, pair_freq
 
-    def bpe_merge(self, word_registry: dict[int, dict], pair_to_words: dict[tuple, set], pair_freq: dict[tuple, int]):
+    def bpe_merge(
+        self,
+        word_registry: dict[int, dict],
+        pair_to_words: dict[tuple, set],
+        pair_freq: dict[tuple, int],
+    ):
         """
         BPE的实现思路
 
@@ -301,11 +327,19 @@ class BPETokenizer:
                 heapq.heappop(heap)
             if not candidates:
                 return None
-            best_pair = max(candidates, key=lambda p: (self.vocabs[p[0]], self.vocabs[p[1]]))
+            best_pair = max(
+                candidates, key=lambda p: (self.vocabs[p[0]], self.vocabs[p[1]])
+            )
             for p in candidates:
                 if p != best_pair and p in pair_freq:
                     heapq.heappush(heap, (-pair_freq[p], p))
             return best_pair
+
+        total_merges = self.vocab_size - len(self.vocabs)
+        milestone = max(1, total_merges // 10)
+        print(
+            f"[BPE] 开始合并，目标 {self.vocab_size} tokens，当前 {len(self.vocabs)}，预计 {total_merges} 轮"
+        )
 
         while len(self.vocabs) < self.vocab_size:
             best_pair = _pop_best()
@@ -318,6 +352,11 @@ class BPETokenizer:
             self.vocabs[new_token_id] = new_token_bytes
             next_token_id += 1
 
+            if len(self.merges) % milestone == 0:
+                print(
+                    f"[BPE] merge {len(self.merges)}/{total_merges}, vocab 已到 {next_token_id}"
+                )
+
             affected_words = pair_to_words.get(best_pair, set())
             affected_word_ids = set(wid for wid, _ in affected_words)
 
@@ -326,11 +365,11 @@ class BPETokenizer:
             # 1. 从所有pair中移除受影响词的所有出现
             for word_id in affected_word_ids:
                 word_info = word_registry[word_id]
-                old_seq = word_info['seq']
-                freq = word_info['freq']
+                old_seq = word_info["seq"]
+                freq = word_info["freq"]
 
                 for pos in range(len(old_seq) - 1):
-                    old_pair = (old_seq[pos], old_seq[pos+1])
+                    old_pair = (old_seq[pos], old_seq[pos + 1])
                     if old_pair in pair_to_words:
                         pair_to_words[old_pair].discard((word_id, pos))
                         if not pair_to_words[old_pair]:
@@ -346,26 +385,29 @@ class BPETokenizer:
             # 2. 更新 word_registry 中的 seq
             for word_id in affected_word_ids:
                 word_info = word_registry[word_id]
-                old_seq = word_info['seq']
+                old_seq = word_info["seq"]
                 new_seq = []
                 i = 0
                 while i < len(old_seq):
-                    if i < len(old_seq) - 1 and (old_seq[i], old_seq[i+1]) == best_pair:
+                    if (
+                        i < len(old_seq) - 1
+                        and (old_seq[i], old_seq[i + 1]) == best_pair
+                    ):
                         new_seq.append(new_token_id)
                         i += 2
                     else:
                         new_seq.append(old_seq[i])
                         i += 1
-                word_info['seq'] = tuple(new_seq)
+                word_info["seq"] = tuple(new_seq)
 
             # 3. 重新添加新 seq 的所有 pair
             for word_id in affected_word_ids:
                 word_info = word_registry[word_id]
-                new_seq = word_info['seq']
-                freq = word_info['freq']
+                new_seq = word_info["seq"]
+                freq = word_info["freq"]
 
                 for new_pos in range(len(new_seq) - 1):
-                    new_pair = (new_seq[new_pos], new_seq[new_pos+1])
+                    new_pair = (new_seq[new_pos], new_seq[new_pos + 1])
                     pair_freq[new_pair] = pair_freq.get(new_pair, 0) + freq
                     if new_pair not in pair_to_words:
                         pair_to_words[new_pair] = set()
@@ -379,8 +421,11 @@ class BPETokenizer:
 
         return self.vocabs, self.merges
 
+    def train(
+        self, fname, vocab_size, max_chunk_size=64 * 1024 * 1024, num_processes=1
+    ):
+        import time
 
-    def train(self, fname, vocab_size, max_chunk_size=64 * 1024 * 1024, num_processes=1):
         # 重置 vocabs 为初始状态：256 基础字节 + special tokens
         self.vocab_size = vocab_size
         self.max_chunk_size = max_chunk_size
@@ -390,19 +435,35 @@ class BPETokenizer:
             self.vocabs[256 + i] = token
             self._special_token_to_id[token] = 256 + i
 
+        print(
+            f"[train] 语料: {fname}, 目标 vocab: {vocab_size}, workers: {num_processes}"
+        )
+
         # Step 1: pretokenized
+        t0 = time.time()
         pre_tokenize_counts = self.pre_tokenize(fname)
+        print(
+            f"[train] 预分词完成，{len(pre_tokenize_counts)} 个唯一 pre-token，耗时 {time.time() - t0:.1f}s"
+        )
 
         # Step 2: 构造索引，方便后续BPE合并
+        t0 = time.time()
         word_registry, pair_to_words, pair_freq = self.create_index(pre_tokenize_counts)
+        print(
+            f"[train] 索引构建完成，{len(pair_freq)} 对 pair，耗时 {time.time() - t0:.1f}s"
+        )
 
         # Step 3: BPE merge
+        t0 = time.time()
         vocabs, merges = self.bpe_merge(word_registry, pair_to_words, pair_freq)
+        print(
+            f"[train] BPE 合并完成，{len(merges)} 条 merges，耗时 {time.time() - t0:.1f}s"
+        )
 
         self.byte_to_id = {v: k for k, v in vocabs.items()}
         self._merge_rank = {pair: i for i, pair in enumerate(self.merges)}
         return vocabs, merges
-    
+
     def _apply_merges(self, byte_seq: list[bytes]) -> list[bytes]:
         if len(byte_seq) <= 1:
             return byte_seq.copy()
@@ -427,19 +488,22 @@ class BPETokenizer:
                 continue
 
             # 合并
-            current[pos:pos + 2] = [current[pos] + current[pos + 1]]
+            current[pos : pos + 2] = [current[pos] + current[pos + 1]]
 
             # 合并后右侧所有 pair 位置都偏移了一位，重新扫描整个序列
             heap.clear()
             for scan_pos in range(len(current) - 1):
-                scan_rank = self._merge_rank.get((current[scan_pos], current[scan_pos + 1]))
+                scan_rank = self._merge_rank.get(
+                    (current[scan_pos], current[scan_pos + 1])
+                )
                 if scan_rank is not None:
                     heapq.heappush(heap, (scan_rank, scan_pos))
 
         return current
-    
+
     def encode(self, text: str):
-        if not text: return []
+        if not text:
+            return []
 
         if self._special_split_re is not None:
             parts = self._special_split_re.split(text)
@@ -450,19 +514,19 @@ class BPETokenizer:
 
         for part in parts:
             if part in self._special_token_strs:
-                all_token_ids.append(self._special_token_to_id[part.encode('utf-8')])
+                all_token_ids.append(self._special_token_to_id[part.encode("utf-8")])
                 continue
 
             # 用同样的 regex pattern 做预分词，保证 BPE 合并不跨 pre-token 边界
             for _match in self._compiled_regex.finditer(part):
                 word = _match.group()
-                byte_seq = [bytes([b]) for b in word.encode('utf-8')]
+                byte_seq = [bytes([b]) for b in word.encode("utf-8")]
                 merged = self._apply_merges(byte_seq)
                 token_ids = [self.byte_to_id[token] for token in merged]
                 all_token_ids.extend(token_ids)
 
         return all_token_ids
-    
+
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """
         惰性编码，适用于大文件
@@ -473,6 +537,5 @@ class BPETokenizer:
                 yield token_id
 
     def decode(self, token_ids: list[int]) -> str:
-        all_bytes = b''.join([self.vocabs[token_id] for token_id in token_ids])
-        return all_bytes.decode('utf-8', errors='replace')
-    
+        all_bytes = b"".join([self.vocabs[token_id] for token_id in token_ids])
+        return all_bytes.decode("utf-8", errors="replace")

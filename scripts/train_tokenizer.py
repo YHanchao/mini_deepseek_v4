@@ -13,16 +13,31 @@ from src.tokenizer import BPETokenizer  # noqa: E402
 def main():
     parser = argparse.ArgumentParser(description="训练 BPE tokenizer")
     parser.add_argument("--input", required=True, help="训练语料文件路径")
-    parser.add_argument("--vocab-size", type=int, required=True, help="目标词表大小（含 special tokens）")
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        required=True,
+        help="目标词表大小（含 special tokens）",
+    )
     parser.add_argument("--output-dir", required=True, help="保存 tokenizer 的目录")
-    parser.add_argument("--special-tokens", nargs="*", default=["<|endoftext|>"],
-                        help="Special token 列表，空格分隔")
-    parser.add_argument("--max-chunk-size", type=int, default=64 * 1024 * 1024,
-                        help="分块大小（字节），默认 64MB")
-    parser.add_argument("--num-processes", type=int, default=1,
-                        help="并行进程数，默认 1")
-    parser.add_argument("--name", default="tokenizer",
-                        help="输出文件名前缀，默认 tokenizer")
+    parser.add_argument(
+        "--special-tokens",
+        nargs="*",
+        default=["<|endoftext|>"],
+        help="Special token 列表，空格分隔",
+    )
+    parser.add_argument(
+        "--max-chunk-size",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="分块大小（字节），默认 512",
+    )
+    parser.add_argument(
+        "--num-processes", type=int, default=16, help="并行进程数，默认 16"
+    )
+    parser.add_argument(
+        "--name", default="tokenizer", help="输出文件名前缀，默认 tokenizer"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
