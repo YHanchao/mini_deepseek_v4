@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Some basic NN blocks
 
@@ -67,21 +68,18 @@ class RotaryPositionalEmbedding(nn.Module):
         )
         pos = torch.arange(max_seq_len, device=device, dtype=torch.float32)
         angles = pos[:, None] * freqs[None, :]  # (max_seq_len, d_k/2)
-        self.register_buffer("cos", torch.cos(angles))
-        self.register_buffer("sin", torch.sin(angles))
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+        self.register_buffer("freqs_cis", cos + 1j * sin)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
-        cos = self.cos[token_positions]  # (seq_len, d_k/2)
-        sin = self.sin[token_positions]  # (seq_len, d_k/2)
+        freqs = self.freqs_cis[token_positions]  # (seq_len, d_k/2) complex
 
         x_reshaped = x.reshape(*x.shape[:-1], -1, 2)  # (..., seq_len, d_k/2, 2)
-        x_even = x_reshaped[..., 0]
-        x_odd = x_reshaped[..., 1]
-
-        x_rot_even = x_even * cos - x_odd * sin
-        x_rot_odd = x_even * sin + x_odd * cos
-
-        x_rot = torch.stack([x_rot_even, x_rot_odd], dim=-1)  # (..., seq_len, d_k/2, 2)
+        x_complex = torch.view_as_complex(x_reshaped)
+        x_rot = torch.view_as_real(x_complex * freqs).flatten(-2)
         return x_rot.reshape(*x.shape)
 
 
@@ -115,45 +113,23 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self.d_k = self.d_v = d_model // num_heads
 
         self.rope = rope
-        causal_mask = torch.triu(
-            torch.full(
-                (max_seq_len, max_seq_len), float("-inf"), device=device, dtype=dtype
-            ),
-            diagonal=1,
-        )
-        self.register_buffer("causal_mask", causal_mask)
 
-        self.Q = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.K = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.V = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.QKV = Linear(d_model, 3 * d_model, device=device, dtype=dtype)
         self.O = Linear(d_model, d_model, device=device, dtype=dtype)
 
-    def attention(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask=None
-    ):
-        d_k = query.shape[-1]
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-        if mask is not None:
-            scores = scores + mask
-        attn = torch.softmax(scores, dim=-1)
-        return torch.matmul(attn, value)
-
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
-        # self.Q(x): (batch, seq, d_model)
-        # view.transpose: (batch, 8, seq, d_k)
-        # Then the shape of Q, K, V satisfies rope and attention func
-        wq_x = self.Q(x).view(*x.shape[:-1], self.num_heads, self.d_k).transpose(1, 2)
-        wk_x = self.K(x).view(*x.shape[:-1], self.num_heads, self.d_k).transpose(1, 2)
-        wv_x = self.V(x).view(*x.shape[:-1], self.num_heads, self.d_k).transpose(1, 2)
+        qkv = self.QKV(x)  # (batch, seq, 3 * d_model)
+        wq_x, wk_x, wv_x = [
+            t.view(*x.shape[:-1], self.num_heads, self.d_k).transpose(1, 2)
+            for t in qkv.chunk(3, dim=-1)
+        ]
 
         # rope
         if self.rope is not None:
             wq_x = self.rope(wq_x, token_positions)
             wk_x = self.rope(wk_x, token_positions)
 
-        # attention
-        seq_len = wq_x.shape[-2]
-        output = self.attention(wq_x, wk_x, wv_x, self.causal_mask[:seq_len, :seq_len])
+        output = F.scaled_dot_product_attention(wq_x, wk_x, wv_x, is_causal=True)
         output = output.transpose(1, 2).contiguous().view(*x.shape[:-1], self.d_model)
 
         return self.O(output)
@@ -169,8 +145,9 @@ class TransformerBlock(nn.Module):
         rope: RotaryPositionalEmbedding | None,
         *,
         eps=1e-5,
+        use_checkpoint: bool = True,
         device=None,
-        dtype=None
+        dtype=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -178,6 +155,7 @@ class TransformerBlock(nn.Module):
         self.d_ff = d_ff
         self.max_seq_len = max_seq_len
         self.rope = rope
+        self.use_checkpoint = use_checkpoint
 
         self.rms_norm_1 = RMSNorm(d_model, eps, device=device, dtype=dtype)
         self.attention = CausalMultiHeadSelfAttention(
@@ -186,7 +164,7 @@ class TransformerBlock(nn.Module):
         self.rms_norm_2 = RMSNorm(d_model, eps, device=device, dtype=dtype)
         self.fnn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
+    def _forward(self, x: torch.Tensor, token_positions: torch.Tensor):
         x1 = self.rms_norm_1(x)
         x1 = self.attention(x1, token_positions)
 
@@ -195,6 +173,13 @@ class TransformerBlock(nn.Module):
         x2 = self.fnn(x2)
 
         return x + x2
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
+        if self.use_checkpoint and self.training:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward, x, token_positions, use_reentrant=False
+            )
+        return self._forward(x, token_positions)
 
 
 class MiniLLM(nn.Module):
@@ -208,8 +193,9 @@ class MiniLLM(nn.Module):
         d_ff: int,
         rope_theta: float,
         *,
+        use_checkpoint: bool = True,
         device=None,
-        dtype=None
+        dtype=None,
     ):
         super().__init__()
         assert d_model % num_heads == 0
@@ -230,6 +216,7 @@ class MiniLLM(nn.Module):
                     max_seq_len=context_length,
                     rope=self.rope,
                     eps=1e-5,
+                    use_checkpoint=use_checkpoint,
                     device=device,
                     dtype=dtype,
                 )
