@@ -159,5 +159,5 @@ class DSMoE(nn.Module):
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
 
-        z = self.shared_experts(x)
+        z = self.shared_expert(x)
         return (y + z).view(shape)
