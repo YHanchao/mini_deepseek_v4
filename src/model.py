@@ -61,23 +61,76 @@ class SwiGLU(nn.Module):
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+    def __init__(
+        self,
+        theta: float,
+        d_k: int,
+        max_seq_len: int,
+        original_seq_len: int = 0,
+        factor: float = 1.0,
+        beta_fast: float = 32.0,
+        beta_slow: float = 1.0,
+        device=None,
+    ):
         super().__init__()
         freqs = theta ** (
             -torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k
-        )
+        )  # 原始RoPE
+
+        if original_seq_len > 0:
+            low, high = self._find_correction_range(
+                beta_fast, beta_slow, d_k, theta, original_seq_len
+            )
+            smooth = 1 - self._linear_ramp_factor(low, high, d_k // 2)
+            freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
         pos = torch.arange(max_seq_len, device=device, dtype=torch.float32)
-        angles = pos[:, None] * freqs[None, :]  # (max_seq_len, d_k/2)
+        angles = pos[:, None] * freqs[None, :]
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         self.register_buffer("cos", cos)
         self.register_buffer("sin", sin)
         self.register_buffer("freqs_cis", cos + 1j * sin)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
-        freqs = self.freqs_cis[token_positions]  # (seq_len, d_k/2) complex
+    @staticmethod
+    def _find_correction_dim(num_rotations, dim, base, max_seq_len):
+        """
+        给定预期旋转次数，反推对应的index是多少
+        """
+        return (
+            dim
+            * math.log(max_seq_len / (num_rotations * 2 * math.pi))
+            / (2 * math.log(base))
+        )
 
-        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)  # (..., seq_len, d_k/2, 2)
+    @staticmethod
+    def _find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+
+        low = math.floor(
+            RotaryPositionalEmbedding._find_correction_dim(
+                low_rot, dim, base, max_seq_len
+            )
+        )
+        high = math.ceil(
+            RotaryPositionalEmbedding._find_correction_dim(
+                high_rot, dim, base, max_seq_len
+            )
+        )
+        return max(low, 0), min(high, dim - 1)
+
+    @staticmethod
+    def _linear_ramp_factor(min_val, max_val, dim):
+        if min_val == max_val:
+            max_val += 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (
+            max_val - min_val
+        )
+        return torch.clamp(linear_func, 0, 1)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
+        freqs = self.freqs_cis[token_positions]
+
+        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
         x_complex = torch.view_as_complex(x_reshaped)
         x_rot = torch.view_as_real(x_complex * freqs).flatten(-2)
         return x_rot.reshape(*x.shape)

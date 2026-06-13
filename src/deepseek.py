@@ -41,6 +41,9 @@ class DSArgs:
     expansion_rate: int = 4
     use_checkpoint: bool = False
 
+    # Attention
+    rope_head_dim: int = 64
+
 
 # MoE的部分是在DeepSeekMoE代码的基础上按照V4的改动做的
 
@@ -226,9 +229,7 @@ class ManifoldHyperConnections(nn.Module):
         """
         batch, seq_len, d = x.shape
         return (
-            x.unsqueeze(1)
-            .expand(batch, n, seq_len, d)
-            .reshape(batch * n, seq_len, d)
+            x.unsqueeze(1).expand(batch, n, seq_len, d).reshape(batch * n, seq_len, d)
         )
 
     @staticmethod
@@ -279,8 +280,7 @@ class ManifoldHyperConnections(nn.Module):
 
         batch, seq_len, _ = x_normed.shape
         h_res_tilde = (
-            self.alpha_res
-            * self.phi_res(x_normed).view(batch, seq_len, self.n, self.n)
+            self.alpha_res * self.phi_res(x_normed).view(batch, seq_len, self.n, self.n)
             + self.bias_res
         )
 
@@ -323,9 +323,7 @@ class ManifoldHyperConnections(nn.Module):
 
         # Residual mix via doubly stochastic matrix
         mixed_by_seq = torch.einsum("bsij,bsjd->bisd", h_res, x_by_seq)
-        mixed_residuals = mixed_by_seq.reshape(
-            batch * self.n, seq_len, self.d_model
-        )
+        mixed_residuals = mixed_by_seq.reshape(batch * self.n, seq_len, self.d_model)
 
         return branch_input, mixed_residuals
 
@@ -355,9 +353,7 @@ class ManifoldHyperConnections(nn.Module):
 
         # Distribute: einsum outputs (b, n, s, d) → reshape to (b*n, s, d)
         post_block = torch.einsum("bsd,bsn->bnsd", branch_output, h_post)
-        post_block = post_block.reshape(
-            batch * self.n, seq_len, self.d_model
-        )
+        post_block = post_block.reshape(batch * self.n, seq_len, self.d_model)
 
         return mixed_residuals + post_block
 
@@ -388,10 +384,199 @@ class ManifoldHyperConnections(nn.Module):
         else:
             h_pre, h_post, h_res = self._compute_kernels(x_normed)
 
-        branch_input, mixed_residuals = self._width_connection(
-            x, h_pre, h_res, batch
-        )
+        branch_input, mixed_residuals = self._width_connection(x, h_pre, h_res, batch)
         branch_output = self.block(branch_input, *args, **kwargs)
-        return self._depth_connection(
-            branch_output, mixed_residuals, h_post, batch
+        return self._depth_connection(branch_output, mixed_residuals, h_post, batch)
+
+
+class Compressor(nn.Module):
+    """
+    Implementation of KV compressor
+
+    Code基本上使用了官方的实现来处理交叉块和decode时的缓存
+    """
+
+    def __init__(
+        self,
+        args: DSArgs,
+        head_dim: int,
+        compress_ratio: int,
+        rope: model.RotaryPositionalEmbedding,
+    ):
+        super().__init__()
+        self.d_model = args.d_model
+        self.head_dim = head_dim  # 文章Section 2.3.1的head dim c
+        self.compress_ratio = compress_ratio  # 文章Section 2.3.1的m
+        self.rope_head_dim = args.rope_head_dim
+        self.rope = rope
+
+        # 要同时维护Ca, Cb, Za, Zb，所以是两倍的head_dim
+        self.weight_kv = model.Linear(
+            self.d_model, 2 * self.head_dim, dtype=torch.float32, device=args.device
         )
+        self.weight_z = model.Linear(
+            self.d_model, 2 * self.head_dim, dtype=torch.float32, device=args.device
+        )
+        self.bias = nn.Parameter(
+            torch.empty(
+                self.compress_ratio,
+                2 * self.head_dim,
+                dtype=torch.float32,
+                device=args.device,
+            )
+        )
+        self.norm = model.RMSNorm(self.head_dim)
+
+        # 解码阶段的状态缓存
+        # 形状: [max_batch, 2 * compress_ratio, 2 * head_dim]
+        # assigned lazily from Attention.kv_cache
+        self.kv_cache: torch.Tensor = None
+        # 解码阶段用到的状态缓存，分别存储未压缩的 KV 和 score
+        self.register_buffer(
+            "kv_state",
+            torch.zeros(
+                args.max_batch_len,
+                2 * compress_ratio,
+                2 * self.head_dim,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "score_state",
+            torch.full(
+                (args.max_batch_len, 2 * compress_ratio, 2 * self.head_dim),
+                float("-inf"),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+
+    def overlap_transform(self, tensor: torch.Tensor, value=0):
+        # tensor: [b, s, compress_ratio, 2 * head_dim]
+        b, s, _, _ = tensor.size()
+        ratio, d = self.compress_ratio, self.head_dim
+
+        # new_tensor: [b, s, 2 * compress_ratio, head_dim]
+        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
+        # 当前块的后半部分（原 b 部分）放在新张量的 [r:2r] 位置
+        # 事实上这一步把所有块的后半部分都先放上去了，等待下面a部分覆盖一遍即可
+        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
+        # 前一块的前半部分（原 a 部分）放在当前块的 [0:r] 位置
+        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        return new_tensor
+
+    def forward(self, x: torch.Tensor, start_pos: int):
+        """
+        压缩input hidden states，对应paper中Eq. (9)-(12)
+
+        args:
+            x: [batch, seqlen, dim]
+            start_pos: 0 = prefill 阶段, >0 = decode 阶段
+        """
+        assert self.kv_cache is not None
+        batch, seq_len, _ = x.shape
+        m = self.compress_ratio
+
+        # (batch, seq_len, 2 * head_dim)
+        dtype = x.dtype
+        x = x.float()  # 压缩需要 fp32
+        kv = self.weight_kv(x)  # c_ab
+        score = self.weight_z(x)  # Z_ab
+
+        if start_pos == 0:
+            # prefill or training stage
+            should_compress = seq_len >= m
+
+            # Step 1: 处理decode时候产生的小尾巴
+            remainder = seq_len % m
+            cut_off = seq_len - remainder  # 能完整压缩的部分
+
+            if cut_off >= m:
+                # 存下最后一个完整块，供decode时消耗
+                self.kv_state[:batch, :m] = kv[:, cut_off - m : cut_off]
+                self.score_state[:batch, :m] = (
+                    score[:, cut_off - m : cut_off] + self.bias
+                )
+
+            # 余数部分暂时保存在 state 中，不参与本次压缩
+            if remainder > 0:
+                kv, self.kv_state[:batch, m : m + remainder] = kv.split(
+                    [cut_off, remainder], dim=1
+                )
+                self.score_state[:batch, m : m + remainder] = (
+                    score[:, cut_off:] + self.bias[:remainder]
+                )
+                score = score[:, :cut_off]
+
+            # Step 2: implement Eq. (9)--(12)
+            # 将序列按 ratio 分块，形状: [b, n/ratio, ratio, coff*d]
+            kv = kv.unflatten(1, (-1, m))
+            score = score.unflatten(1, (-1, m)) + self.bias
+
+            # 构造重叠窗口，得到 [b, n/ratio, 2*ratio, d]
+            kv = self.overlap_transform(kv, 0)
+            score = self.overlap_transform(score, float("-inf"))
+
+            # softmax 沿每个压缩块的 2*ratio (或 ratio) 个元素，对 score 归一化
+            # Eq (11) softmax，然后Eq(12) 加权求和
+            kv = (kv * score.softmax(dim=2)).sum(dim=2)  # 压缩后形状 [b, n/ratio, d]
+
+        else:
+            # decode部分
+            # 利用在prefill阶段已经维护好的历史信息
+            should_compress = (start_pos + 1) % m == 0
+            index = start_pos % m
+            score += self.bias[index]
+
+            # 将当前 token 存入 kv_state 和 score_state 的“b 部分”（ratio + 偏移）
+            self.kv_state[:batch, m + index] = kv.squeeze(1)
+            self.score_state[:batch, m + index] = score.squeeze(1)
+
+            if should_compress:
+                # 取出需要压缩的两个窗口：前 r 个来自前一组的 b 部分，后 r 个来自当前组的 a 部分
+                kv_state = torch.cat(
+                    [
+                        self.kv_state[:batch, :m, : self.head_dim],
+                        self.kv_state[:batch, m:, self.head_dim :],
+                    ],
+                    dim=1,
+                )
+                score_state = torch.cat(
+                    [
+                        self.score_state[:batch, :m, : self.head_dim],
+                        self.score_state[:batch, m:, self.head_dim :],
+                    ],
+                    dim=1,
+                )
+                # 加权求和压缩
+                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+
+                # 将 b 部分整体复制到 a 部分，为下一次重叠做准备
+                self.kv_state[:batch, :m] = self.kv_state[:batch, m:]
+                self.score_state[:batch, :m] = self.score_state[:batch, m:]
+
+        if not should_compress:
+            # 没凑够m个token，不压缩
+            return None
+
+        kv = self.norm(kv)
+
+        if start_pos == 0:
+            # 预填充：每隔 ratio 个 token 取最后一个位置作为压缩结果的代表
+            positions = torch.arange(0, cut_off, m, device=kv.device)
+        else:
+            # 解码：当前压缩结果的代表位置
+            positions = torch.tensor(
+                [start_pos + 1 - self.compress_ratio], device=kv.device
+            )
+
+        kv[..., -self.rope_head_dim :] = self.rope(
+            kv[..., -self.rope_head_dim :], positions
+        )
+
+        if start_pos == 0:
+            self.kv_cache[:batch, : seq_len // m] = kv
+        else:
+            self.kv_cache[:batch, start_pos // m] = kv.squeeze(1)
+        return kv
