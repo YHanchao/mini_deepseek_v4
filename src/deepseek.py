@@ -43,6 +43,11 @@ class DSArgs:
 
     # Attention
     rope_head_dim: int = 64
+    index_head_dim: int = 512
+    index_num: int = 4
+    compress_ratio: int = 4
+    attn_rank: int = 64
+    index_topk: int = 4
 
 
 # MoE的部分是在DeepSeekMoE代码的基础上按照V4的改动做的
@@ -580,3 +585,122 @@ class Compressor(nn.Module):
         else:
             self.kv_cache[:batch, start_pos // m] = kv.squeeze(1)
         return kv
+
+
+class Indexer(nn.Module):
+    def __init__(self, args: DSArgs, rope: model.RotaryPositionalEmbedding):
+        super().__init__()
+        self.d_model = args.d_model
+        self.compress_ratio = args.compress_ratio
+        self.rope_head_dim = args.rope_head_dim
+        self.index_head_dim = args.index_head_dim
+        self.index_num = args.index_num
+        self.attn_rank = args.attn_rank
+        self.index_topk = args.index_topk
+
+        self.rope = rope
+
+        self.weight_iuq = model.Linear(
+            self.attn_rank,
+            self.index_num * self.index_head_dim,
+            device=args.device,
+            dtype=args.dtype,
+        )
+        self.weight_h = model.Linear(
+            self.d_model, self.index_num, device=args.device, dtype=args.dtype
+        )
+
+        self.compressor = Compressor(
+            args, self.index_head_dim, self.compress_ratio, rope
+        )
+
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(
+                args.max_batch_len,
+                args.max_seq_len // args.compress_ratio,
+                self.index_head_dim,
+            ),
+            persistent=False,
+        )
+
+        # 本质上Indexer部分实现了一个mini的Attention
+        # 在Eq.16有一堆求和，除上一个scale保持数值稳定
+        self.attention_scale = (self.index_head_dim * self.index_num) ** -0.5
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        query: torch.Tensor,
+        start_pos: int,
+        offset: int,
+    ):
+        """
+        原文中Eq. (13)输入hidden state生成compressed latent vector for query
+        但这个向量c_t^Q是整个Attention共享的 (Shared KV MQA)
+        所以这里要同时输入原始的x和Attention部分创建好的query c_t^Q
+        """
+        batch, seq_len, _ = hidden_state.size()
+        m = self.compress_ratio
+        rd = self.rope_head_dim
+        end_pos = start_pos + seq_len
+
+        if self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache
+
+        # Eq.14
+        # index_query: (batch, len, n_index, d_index)
+        index_query = self.weight_iuq(query)
+        index_query = index_query.unflatten(-1, (self.index_num, self.index_head_dim))
+
+        # Obtain K_s^{IComp}
+        # K is stored in kv_cache
+        self.compressor(hidden_state, start_pos)
+
+        # Compressor里面的hidden state被旋转了一次，这里同样旋转
+        # Apply RoPE
+        positions = torch.arange(
+            start_pos, start_pos + seq_len, device=index_query.device
+        )
+        index_query[..., -rd:] = self.rope(index_query[..., -rd:], positions)
+
+        # Eq.15
+        # Eq15~16这里类似于做了一个小的attention
+        # 为了数值稳定性，除掉一个\sqrt{d * n}
+        # weights: (b, s, n_index)
+        weights = self.weight_h(hidden_state) * self.attention_scale
+
+        # q_{th}^I K_s^{IComp}
+        index_score = torch.einsum(
+            "bsnd,bld->bsnl", index_query, self.kv_cache[:batch, : end_pos // m]
+        )
+
+        # I: (batch, seq, block_num)
+        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=-2)
+
+        if start_pos == 0:
+            # Eq.17: 训练and prefill 选topk时不能选未来的，因果掩码
+            # Implement s < floor(t / m)
+
+            # left tensor: (seq_len, n_block)
+            # _left[i] = [0, ..., n_block - 1] for each i
+            _left = torch.arange(seq_len // m).repeat(seq_len, 1)
+
+            # right tensor: (seq_len, 1)
+            # _right[..., 0] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, ..., n_block]
+            _right = torch.arange(1, seq_len + 1).unsqueeze(1) // m
+
+            mask = _left >= _right
+            index_score += torch.where(mask, float("-inf"), 0)
+
+        topk_idxs = index_score.topk(min(self.index_topk, end_pos // m), dim=-1)[1]
+
+        if start_pos == 0:
+            # 在序列一开始时，上一层会全都fill为-inf
+            # 那么返回的topk是没有意义的
+            # 所以进一步筛选，保证topk_idx取值合理
+            mask = topk_idxs >= torch.arange(1, seq_len + 1).unsqueeze(1) // m
+            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+        else:
+            topk_idxs += offset
+        return topk_idxs
