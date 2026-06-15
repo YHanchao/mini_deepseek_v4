@@ -6,9 +6,11 @@ DeepSeek似乎很多地方都要做混合精度，需要注意不能直接全都
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Tuple, Optional, Literal
 
 import torch
+torch.set_default_device("cuda:0")
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -421,26 +423,27 @@ class Compressor(nn.Module):
         self.compress_ratio = compress_ratio  # 文章Section 2.3.1的m
         self.rope_head_dim = args.rope_head_dim
         self.rope = rope
+        self.overlap = compress_ratio == 4
+        coff = 1 + self.overlap  # 2 when overlap, 1 otherwise
 
-        # 要同时维护Ca, Cb, Za, Zb，所以是两倍的head_dim
+        # 要同时维护Ca, Cb, Za, Zb，所以是两倍的head_dim（仅overlap时）
         self.weight_kv = model.Linear(
-            self.d_model, 2 * self.head_dim, dtype=torch.float32, device=args.device
+            self.d_model, coff * self.head_dim, dtype=torch.float32, device=args.device
         )
         self.weight_z = model.Linear(
-            self.d_model, 2 * self.head_dim, dtype=torch.float32, device=args.device
+            self.d_model, coff * self.head_dim, dtype=torch.float32, device=args.device
         )
         self.bias = nn.Parameter(
             torch.zeros(
                 self.compress_ratio,
-                2 * self.head_dim,
+                coff * self.head_dim,
                 dtype=torch.float32,
                 device=args.device,
             )
         )
-        self.norm = model.RMSNorm(self.head_dim)
+        self.norm = model.RMSNorm(self.head_dim, device=args.device)
 
         # 解码阶段的状态缓存
-        # 形状: [max_batch, 2 * compress_ratio, 2 * head_dim]
         # assigned lazily from Attention.kv_cache
         self.kv_cache: torch.Tensor = None
         # 解码阶段用到的状态缓存，分别存储未压缩的 KV 和 score
@@ -448,18 +451,20 @@ class Compressor(nn.Module):
             "kv_state",
             torch.zeros(
                 args.max_batch_len,
-                2 * compress_ratio,
-                2 * self.head_dim,
+                coff * compress_ratio,
+                coff * self.head_dim,
                 dtype=torch.float32,
+                device=args.device,
             ),
             persistent=False,
         )
         self.register_buffer(
             "score_state",
             torch.full(
-                (args.max_batch_len, 2 * compress_ratio, 2 * self.head_dim),
+                (args.max_batch_len, coff * compress_ratio, coff * self.head_dim),
                 float("-inf"),
                 dtype=torch.float32,
+                device=args.device,
             ),
             persistent=False,
         )
@@ -488,9 +493,8 @@ class Compressor(nn.Module):
         """
         assert self.kv_cache is not None
         batch, seq_len, _ = x.shape
-        m = self.compress_ratio
+        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
 
-        # (batch, seq_len, 2 * head_dim)
         dtype = x.dtype
         x = x.float()  # 压缩需要 fp32
         kv = self.weight_kv(x)  # c_ab
@@ -498,85 +502,106 @@ class Compressor(nn.Module):
 
         if start_pos == 0:
             # prefill or training stage
-            should_compress = seq_len >= m
+            should_compress = seq_len >= ratio
 
             # Step 1: 处理decode时候产生的小尾巴
-            remainder = seq_len % m
+            remainder = seq_len % ratio
             cut_off = seq_len - remainder  # 能完整压缩的部分
 
-            if cut_off >= m:
-                # 存下最后一个完整块，供decode时消耗
-                self.kv_state[:batch, :m] = kv[:, cut_off - m : cut_off]
-                self.score_state[:batch, :m] = (
-                    score[:, cut_off - m : cut_off] + self.bias
-                )
+            if overlap:
+                # ---- overlap path (ratio == 4) ----
+                if cut_off >= ratio:
+                    # 存下最后一个完整块，供decode时消耗
+                    self.kv_state[:batch, :ratio] = kv[:, cut_off - ratio : cut_off]
+                    self.score_state[:batch, :ratio] = (
+                        score[:, cut_off - ratio : cut_off] + self.bias
+                    )
 
-            # 余数部分暂时保存在 state 中，不参与本次压缩
-            if remainder > 0:
-                kv, self.kv_state[:batch, m : m + remainder] = kv.split(
-                    [cut_off, remainder], dim=1
-                )
-                self.score_state[:batch, m : m + remainder] = (
-                    score[:, cut_off:] + self.bias[:remainder]
-                )
-                score = score[:, :cut_off]
+                if remainder > 0:
+                    kv, self.kv_state[:batch, ratio : ratio + remainder] = kv.split(
+                        [cut_off, remainder], dim=1
+                    )
+                    self.score_state[:batch, ratio : ratio + remainder] = (
+                        score[:, cut_off:] + self.bias[:remainder]
+                    )
+                    score = score[:, :cut_off]
 
-            # Step 2: implement Eq. (9)--(12)
-            # 将序列按 ratio 分块，形状: [b, n/ratio, ratio, coff*d]
-            kv = kv.unflatten(1, (-1, m))
-            score = score.unflatten(1, (-1, m)) + self.bias
+                # Step 2: implement Eq. (9)--(12)
+                kv = kv.unflatten(1, (-1, ratio))
+                score = score.unflatten(1, (-1, ratio)) + self.bias
 
-            # 构造重叠窗口，得到 [b, n/ratio, 2*ratio, d]
-            kv = self.overlap_transform(kv, 0)
-            score = self.overlap_transform(score, float("-inf"))
+                # 构造重叠窗口
+                kv = self.overlap_transform(kv, 0)
+                score = self.overlap_transform(score, float("-inf"))
 
-            # softmax 沿每个压缩块的 2*ratio (或 ratio) 个元素，对 score 归一化
-            # Eq (11) softmax，然后Eq(12) 加权求和
-            kv = (kv * score.softmax(dim=2)).sum(dim=2)  # 压缩后形状 [b, n/ratio, d]
+                # softmax over 2*ratio elements, then weighted sum
+                kv = (kv * score.softmax(dim=2)).sum(dim=2)
+            else:
+                # ---- non-overlap path (ratio == 128) ----
+                if remainder > 0:
+                    self.kv_state[:batch, :remainder] = kv[:, cut_off:]
+                    self.score_state[:batch, :remainder] = (
+                        score[:, cut_off:] + self.bias[:remainder]
+                    )
+                    kv = kv[:, :cut_off]
+                    score = score[:, :cut_off]
+
+                kv = kv.unflatten(1, (-1, ratio))
+                score = score.unflatten(1, (-1, ratio)) + self.bias
+
+                # softmax over ratio elements, then weighted sum
+                kv = (kv * score.softmax(dim=2)).sum(dim=2)
 
         else:
             # decode部分
-            # 利用在prefill阶段已经维护好的历史信息
-            should_compress = (start_pos + 1) % m == 0
-            index = start_pos % m
-            score += self.bias[index]
+            should_compress = (start_pos + 1) % ratio == 0
+            index = start_pos % ratio
 
-            # 将当前 token 存入 kv_state 和 score_state 的“b 部分”（ratio + 偏移）
-            self.kv_state[:batch, m + index] = kv.squeeze(1)
-            self.score_state[:batch, m + index] = score.squeeze(1)
+            if overlap:
+                # ---- overlap path (ratio == 4) ----
+                score += self.bias[index]
 
-            if should_compress:
-                # 取出需要压缩的两个窗口：前 r 个来自前一组的 b 部分，后 r 个来自当前组的 a 部分
-                kv_state = torch.cat(
-                    [
-                        self.kv_state[:batch, :m, : self.head_dim],
-                        self.kv_state[:batch, m:, self.head_dim :],
-                    ],
-                    dim=1,
-                )
-                score_state = torch.cat(
-                    [
-                        self.score_state[:batch, :m, : self.head_dim],
-                        self.score_state[:batch, m:, self.head_dim :],
-                    ],
-                    dim=1,
-                )
-                # 加权求和压缩
-                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                self.kv_state[:batch, ratio + index] = kv.squeeze(1)
+                self.score_state[:batch, ratio + index] = score.squeeze(1)
 
-                # 将 b 部分整体复制到 a 部分，为下一次重叠做准备
-                self.kv_state[:batch, :m] = self.kv_state[:batch, m:]
-                self.score_state[:batch, :m] = self.score_state[:batch, m:]
+                if should_compress:
+                    kv_state = torch.cat(
+                        [
+                            self.kv_state[:batch, :ratio, :d],
+                            self.kv_state[:batch, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    score_state = torch.cat(
+                        [
+                            self.score_state[:batch, :ratio, :d],
+                            self.score_state[:batch, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+
+                    self.kv_state[:batch, :ratio] = self.kv_state[:batch, ratio:]
+                    self.score_state[:batch, :ratio] = self.score_state[:batch, ratio:]
+            else:
+                # ---- non-overlap path (ratio == 128) ----
+                self.kv_state[:batch, index] = kv.squeeze(1)
+                self.score_state[:batch, index] = score.squeeze(1) + self.bias[index]
+
+                if should_compress:
+                    kv = (self.kv_state[:batch] * self.score_state[:batch].softmax(dim=1)).sum(
+                        dim=1, keepdim=True
+                    )
 
         if not should_compress:
-            # 没凑够m个token，不压缩
+            # 没凑够ratio个token，不压缩
             return None
 
         kv = self.norm(kv)
 
         if start_pos == 0:
-            # 预填充：每隔 ratio 个 token 取最后一个位置作为压缩结果的代表
-            positions = torch.arange(0, cut_off, m, device=kv.device)
+            # 预填充：每隔 ratio 个 token 取 start of each block 作为代表位置
+            positions = torch.arange(0, cut_off, ratio, device=kv.device)
         else:
             # 解码：当前压缩结果的代表位置
             positions = torch.tensor(
@@ -588,9 +613,9 @@ class Compressor(nn.Module):
         )
 
         if start_pos == 0:
-            self.kv_cache[:batch, : seq_len // m] = kv
+            self.kv_cache[:batch, : seq_len // ratio] = kv
         else:
-            self.kv_cache[:batch, start_pos // m] = kv.squeeze(1)
+            self.kv_cache[:batch, start_pos // ratio] = kv.squeeze(1)
         return kv
 
 
@@ -627,6 +652,7 @@ class Indexer(nn.Module):
                 args.max_batch_len,
                 args.max_seq_len // args.compress_ratio,
                 self.index_head_dim,
+                device=args.device,
             ),
             persistent=False,
         )
@@ -691,11 +717,11 @@ class Indexer(nn.Module):
 
             # left tensor: (seq_len, n_block)
             # _left[i] = [0, ..., n_block - 1] for each i
-            _left = torch.arange(seq_len // m).repeat(seq_len, 1)
+            _left = torch.arange(seq_len // m, device=index_score.device).repeat(seq_len, 1)
 
             # right tensor: (seq_len, 1)
             # _right[..., 0] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, ..., n_block]
-            _right = torch.arange(1, seq_len + 1).unsqueeze(1) // m
+            _right = torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1) // m
 
             mask = _left >= _right
             index_score += torch.where(mask, float("-inf"), 0)
@@ -706,7 +732,7 @@ class Indexer(nn.Module):
             # 在序列一开始时，上一层会全都fill为-inf
             # 那么返回的topk是没有意义的
             # 所以进一步筛选，保证topk_idx取值合理
-            mask = topk_idxs >= torch.arange(1, seq_len + 1).unsqueeze(1) // m
+            mask = topk_idxs >= torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1) // m
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
         else:
             topk_idxs += offset
@@ -732,11 +758,13 @@ class Attention(nn.Module):
         self.output_lora = args.output_lora
 
         self.window_size = args.window_size  # 根据论文，滑动窗口保留前n_win个token
-        # 于是kv_cache总共有两部分，前win个是最新的win个token，后面的压缩
-        self.kv_cache_size = self.window_size + args.max_seq_len // self.compress_ratio
+        # 于是kv_cache总共有两部分，前win个是最新的win个token，后面的压缩（如果有）
+        self.kv_cache_size = self.window_size + (
+            args.max_seq_len // self.compress_ratio if self.compress_ratio else 0
+        )
         self.register_buffer(
             "kv_cache",
-            torch.zeros(args.max_batch_len, self.kv_cache_size, self.head_dim),
+            torch.zeros(args.max_batch_len, self.kv_cache_size, self.head_dim, device=args.device),
             persistent=False,
         )
 
@@ -759,7 +787,7 @@ class Attention(nn.Module):
         )
 
         self.rope = rope
-        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32, device=args.device))
 
         self.o_down = model.Linear(
             self.n_heads * self.head_dim // self.output_group,
@@ -774,8 +802,11 @@ class Attention(nn.Module):
             dtype=args.dtype,
         )
 
-        self.compressor = Compressor(args, self.head_dim, self.compress_ratio, rope)
-        self.indexer = Indexer(args, rope)
+        self.compressor = (
+            Compressor(args, self.head_dim, self.compress_ratio, rope)
+            if self.compress_ratio else None
+        )
+        self.indexer = Indexer(args, rope) if self.compress_ratio == 4 else None
 
     def _get_window_topk_id(self, batch: int, seq_len: int, start_pos: int):
         """
@@ -824,6 +855,47 @@ class Attention(nn.Module):
 
         return matrix.unsqueeze(0).expand(batch, -1, -1)
 
+    @lru_cache(2)
+    def _get_compress_topk_id(
+        self, batch: int, seq_len: int, start_pos: int, offset: int
+    ):
+        """
+        Select every compress_ratio-th compressed block uniformly.
+
+        与Indexer不同，这个方法是直接按照ratio均匀选取压缩块，
+        不做学习式的稀疏选择。用于ratio=128等没有Indexer的场景。
+
+        Output: Tensor of shape (batch_size, seq_len, n_compressed_blocks)
+
+        示例 (ratio=4, seq_len=12, start_pos=0, offset=0):
+        [[ 0, -1, -1],
+         [ 0, -1, -1],
+         [ 0, -1, -1],
+         [ 0, -1, -1],
+         [ 1, -1, -1],
+         [ 1, -1, -1],
+         [ 1, -1, -1],
+         [ 1, -1, -1],
+         [ 1,  2, -1],
+         [ 1,  2, -1],
+         [ 1,  2, -1],
+         [ 1,  2, -1]]
+        第t行能看到所有 block_index < floor(t/ratio) 的压缩块。
+        """
+        ratio = self.compress_ratio
+        if start_pos > 0:
+            # decode：返回目前已压缩的所有块索引
+            matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
+        else:
+            # prefill / training：因果掩码，t位置不能看到未来的压缩块
+            # left: (seq_len, n_blocks) — [0,0,0,0, 1,1,1,1, 2,2,2,2]
+            matrix = torch.arange(seq_len // ratio).repeat(seq_len, 1)
+            # right: (seq_len, 1) — floor(t/ratio)
+            mask = matrix >= torch.arange(1, seq_len + 1).unsqueeze(1) // ratio
+            matrix = torch.where(mask, -1, matrix + offset)
+
+        return matrix.unsqueeze(0).expand(batch, -1, -1)
+
     def _sparse_attention(
         self,
         q: torch.Tensor,
@@ -849,11 +921,12 @@ class Attention(nn.Module):
         topk = topk_idxs.shape[-1]
 
         # Step 1: 根据topk的索引取出kv
-        idx = topk_idxs.unsqueeze(-1).expand(-1, -1, -1, d)  # (b, m, topk, d)
-        k = v = kv.gather(1, idx)  # (b, m, topk, d)
-
-        # Step 2: mask掉无效索引 topk = -1
+        # kv: (b, kv_len, d), topk_idxs: (b, m, topk) — 每个query位置有独立的topk索引
+        # mask 掉无效索引（-1），clamp 到 0 避免 gather 报错，之后用 mask 置 -inf
         mask = topk_idxs == -1
+        idx = topk_idxs.clamp(0).unsqueeze(-1).expand(-1, -1, -1, d)  # (b, m, topk, d)
+        kv_expanded = kv.unsqueeze(1).expand(-1, m, -1, -1)  # (b, m, kv_len, d)
+        k = v = kv_expanded.gather(2, idx)  # (b, m, topk, d)
 
         # Step 3: Attention
         score = torch.einsum("bmhd,bmkd->bmhk", q, k) * softmax_scale
@@ -877,7 +950,7 @@ class Attention(nn.Module):
         win = self.window_size
 
         # Initialization
-        if self.compressor.kv_cache is None:
+        if self.compress_ratio and self.compressor.kv_cache is None:
             # 约定前win个放最近的token，后面的放压缩
             self.compressor.kv_cache = self.kv_cache[:, win:]
 
@@ -899,8 +972,20 @@ class Attention(nn.Module):
         topk_win = self._get_window_topk_id(batch, seq_len, start_pos)
         # 预填充时kv = cat([kv, kv_compress])，需要offset seq_len个
         offset = seq_len if start_pos == 0 else self.window_size
-        compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
-        topk_idxs = torch.cat([topk_win, compress_topk_idxs], dim=-1)
+
+        if m == 4:
+            compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+        elif m > 0:
+            compress_topk_idxs = self._get_compress_topk_id(
+                batch, seq_len, start_pos, offset
+            ).to(kv.device)
+        else:
+            compress_topk_idxs = None
+
+        if compress_topk_idxs is not None:
+            topk_idxs = torch.cat([topk_win, compress_topk_idxs], dim=-1)
+        else:
+            topk_idxs = topk_win
 
         if start_pos == 0:
             # prefill or training
@@ -920,9 +1005,10 @@ class Attention(nn.Module):
                 ].split([win - cutoff, cutoff], dim=1)
 
             # 之后是压缩部分的
-            kv_compress = self.compressor(x, start_pos)
-            if kv_compress is not None:
-                kv = torch.cat([kv, kv_compress], dim=1)
+            if m:
+                kv_compress = self.compressor(x, start_pos)
+                if kv_compress is not None:
+                    kv = torch.cat([kv, kv_compress], dim=1)
 
             # Sparse Attention
             o = self._sparse_attention(
@@ -931,7 +1017,8 @@ class Attention(nn.Module):
 
         else:
             self.kv_cache[:batch, start_pos % win] = kv.squeeze(1)
-            self.compressor(x, start_pos)
+            if m:
+                self.compressor(x, start_pos)
 
             # Sparse Attention
             o = self._sparse_attention(

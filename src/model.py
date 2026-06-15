@@ -1,6 +1,7 @@
 import math
 
 import torch
+torch.set_default_device("cuda:0")
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -134,6 +135,13 @@ class RotaryPositionalEmbedding(nn.Module):
 
         x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
         x_complex = torch.view_as_complex(x_reshaped)
+
+        # 显式 reshape freqs 以适配多头输入，与官方 apply_rotary_emb 一致
+        if x_complex.ndim == 3:
+            freqs = freqs.view(1, x_complex.size(1), x_complex.size(-1))
+        else:
+            freqs = freqs.view(1, x_complex.size(1), 1, x_complex.size(-1))
+
         x_rot = torch.view_as_real(x_complex * freqs).flatten(-2)
         return x_rot.reshape(*x.shape)
 
