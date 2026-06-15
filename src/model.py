@@ -127,8 +127,10 @@ class RotaryPositionalEmbedding(nn.Module):
         )
         return torch.clamp(linear_func, 0, 1)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor, inverse: bool = False):
         freqs = self.freqs_cis[token_positions]
+        if inverse:
+            freqs = freqs.conj()
 
         x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
         x_complex = torch.view_as_complex(x_reshaped)

@@ -165,3 +165,5 @@ checkpoints/*
 .claude/
 .vscode/
 .idea/
+backups/
+cs336*/

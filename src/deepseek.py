@@ -42,12 +42,19 @@ class DSArgs:
     use_checkpoint: bool = False
 
     # Attention
+    n_heads: int = 64
+    head_dim: int = 512
     rope_head_dim: int = 64
-    index_head_dim: int = 512
+    index_head_dim: int = 128
     index_num: int = 4
     compress_ratio: int = 4
     attn_rank: int = 64
     index_topk: int = 4
+    window_size: int = 128
+    output_group: int = 8
+    output_lora: int = 1024
+
+    eps: float = 1e-5
 
 
 # MoE的部分是在DeepSeekMoE代码的基础上按照V4的改动做的
@@ -423,7 +430,7 @@ class Compressor(nn.Module):
             self.d_model, 2 * self.head_dim, dtype=torch.float32, device=args.device
         )
         self.bias = nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 self.compress_ratio,
                 2 * self.head_dim,
                 dtype=torch.float32,
@@ -704,3 +711,236 @@ class Indexer(nn.Module):
         else:
             topk_idxs += offset
         return topk_idxs
+
+
+class Attention(nn.Module):
+    def __init__(self, args: DSArgs, rope: model.RotaryPositionalEmbedding):
+        super().__init__()
+
+        self.compress_ratio = args.compress_ratio
+        self.index_num = args.index_num
+        self.n_heads = args.n_heads
+        self.eps = args.eps
+
+        self.d_model = args.d_model  # initial dim for hidden state, d
+        self.head_dim = args.head_dim  # dimension for compressor dim, i.e., c
+        self.index_head_dim = args.index_head_dim  # dimension for index dim, c^I
+        self.rope_head_dim = args.rope_head_dim  # RoPE applies for last rd dimensions
+        self.attn_rank = args.attn_rank  # hidden state is projected onto d_c dim
+        self.softmax_scale = self.head_dim**-0.5
+        self.output_group = args.output_group
+        self.output_lora = args.output_lora
+
+        self.window_size = args.window_size  # 根据论文，滑动窗口保留前n_win个token
+        # 于是kv_cache总共有两部分，前win个是最新的win个token，后面的压缩
+        self.kv_cache_size = self.window_size + args.max_seq_len // self.compress_ratio
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(args.max_batch_len, self.kv_cache_size, self.head_dim),
+            persistent=False,
+        )
+
+        self.proj_lora = model.Linear(
+            self.d_model, self.attn_rank, device=args.device, dtype=args.dtype
+        )
+        self.rms_norm_q = model.RMSNorm(
+            self.attn_rank, device=args.device, dtype=args.dtype
+        )
+        self.w_uq = model.Linear(
+            self.attn_rank,
+            self.n_heads * self.head_dim,
+            device=args.device,
+            dtype=args.dtype,
+        )
+
+        self.weight_kv = model.Linear(self.d_model, self.head_dim)
+        self.rms_norm_kv = model.RMSNorm(
+            self.head_dim, device=args.device, dtype=args.dtype
+        )
+
+        self.rope = rope
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
+
+        self.o_down = model.Linear(
+            self.n_heads * self.head_dim // self.output_group,
+            self.output_group * self.output_lora,
+            device=args.device,
+            dtype=args.dtype,
+        )  # 这里事实上只是用了Linear的参数初始化，实际中没有使用forward
+        self.o_up = model.Linear(
+            self.output_group * self.output_lora,
+            self.d_model,
+            device=args.device,
+            dtype=args.dtype,
+        )
+
+        self.compressor = Compressor(args, self.head_dim, self.compress_ratio, rope)
+        self.indexer = Indexer(args, rope)
+
+    def _get_window_topk_id(self, batch: int, seq_len: int, start_pos: int):
+        """
+        Output: Tensor of shape (batch_size, seq_len, window_size)
+        """
+        if start_pos >= self.window_size - 1:
+            # 这个时候kv_cache前win个保存的形如 (10, 11, 7, 8, 9)
+            # 预期返回(2, 3, 4, 0, 1)
+            start_pos %= self.window_size
+            matrix = torch.cat(
+                [
+                    torch.arange(start_pos + 1, self.window_size),
+                    torch.arange(0, start_pos + 1),
+                ],
+                dim=0,
+            )
+        elif start_pos > 0:
+            # 这个时候预期返回(0,1,2,-1,-1)
+            matrix = F.pad(
+                torch.arange(start_pos + 1),
+                (0, self.window_size - start_pos - 1),
+                value=-1,
+            )
+        else:
+            # prefill and training
+            # 预期返回
+            # [[ 0, -1, -1, -1, -1],
+            # [ 0,  1, -1, -1, -1],
+            # [ 0,  1,  2, -1, -1],
+            # [ 0,  1,  2,  3, -1],
+            # [ 0,  1,  2,  3,  4],
+            # [ 1,  2,  3,  4,  5],
+            # [ 2,  3,  4,  5,  6],
+            # [ 3,  4,  5,  6,  7],
+            # [ 4,  5,  6,  7,  8],
+            # [ 5,  6,  7,  8,  9],
+            # [ 6,  7,  8,  9, 10],
+            # [ 7,  8,  9, 10, 11]]
+
+            # (0, 1, 2, ..., 10, 11)
+            base = torch.arange(seq_len).unsqueeze(1)
+            # (0,0,0,0,0,1,2,3,4,5,6,7)
+            start = (base - self.window_size + 1).clamp(0)
+            matrix = start + torch.arange(min(seq_len, self.window_size))
+            matrix = torch.where(matrix > base, -1, matrix)
+
+        return matrix.unsqueeze(0).expand(batch, -1, -1)
+
+    def _sparse_attention(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        attn_sink: torch.Tensor,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """
+        PyTorch version 的 sparse attention 实现
+        后续用triton重写
+
+        Inputs:
+        - q: query (batch, len, n_head, head_dim)
+        - kv: shared kv (batch, len // m, head_dim)
+        - topk_idxs: (batch, len, topk)
+        - attn_sink: addtitional bias for each head, (h,)
+
+        Output:
+        - o: (batch, len, n_head, head_dim)
+        """
+        b, m, h, d = q.shape
+        topk = topk_idxs.shape[-1]
+
+        # Step 1: 根据topk的索引取出kv
+        idx = topk_idxs.unsqueeze(-1).expand(-1, -1, -1, d)  # (b, m, topk, d)
+        k = v = kv.gather(1, idx)  # (b, m, topk, d)
+
+        # Step 2: mask掉无效索引 topk = -1
+        mask = topk_idxs == -1
+
+        # Step 3: Attention
+        score = torch.einsum("bmhd,bmkd->bmhk", q, k) * softmax_scale
+        score = score.masked_fill(mask.unsqueeze(2), float("-inf"))
+
+        # Step 4: Add attention sink
+        # (h,) -> (1, 1, h, 1) -> (b, m, h, 1)
+        sink = attn_sink.view(1, 1, h, 1).expand(b, m, -1, 1)
+        score = torch.cat([score, sink], dim=-1)  # (b,m,h,k+1)
+
+        # Step 5: softmax
+        weight = torch.softmax(score, dim=-1)[..., :topk]
+
+        output = torch.einsum("bmhk,bmkd->bmhd", weight, v)
+        return output
+
+    def forward(self, x: torch.Tensor, start_pos: int):
+        batch, seq_len, _ = x.size()
+        m = self.compress_ratio
+        rd = self.rope_head_dim
+        win = self.window_size
+
+        # Initialization
+        if self.compressor.kv_cache is None:
+            # 约定前win个放最近的token，后面的放压缩
+            self.compressor.kv_cache = self.kv_cache[:, win:]
+
+        qr = self.rms_norm_q(self.proj_lora(x))  # Eq.13
+        q = self.w_uq(qr).unflatten(-1, (self.n_heads, self.head_dim))  # Eq.18
+
+        # 归一化
+        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+
+        # RoPE for query
+        positions = torch.arange(start_pos, start_pos + seq_len, device=q.device)
+        q[..., -rd:] = self.rope(q[..., -rd:], positions)
+
+        # kv
+        kv = self.rms_norm_kv(self.weight_kv(x))
+        kv[..., -rd:] = self.rope(kv[..., -rd:], positions)
+
+        # select topk indices
+        topk_win = self._get_window_topk_id(batch, seq_len, start_pos)
+        # 预填充时kv = cat([kv, kv_compress])，需要offset seq_len个
+        offset = seq_len if start_pos == 0 else self.window_size
+        compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+        topk_idxs = torch.cat([topk_win, compress_topk_idxs], dim=-1)
+
+        if start_pos == 0:
+            # prefill or training
+            # 先写滑动窗口的，放到前win个
+            if seq_len <= win:
+                # 直接存
+                self.kv_cache[:batch, :seq_len] = kv
+            else:
+                # 在decode时按照 start_pos % win 保存的话
+                # 相当于前win个写满后，要接着回到一开始，覆盖旧的数据
+                # 所以prefill的时候，假设win_size = 5, len = 12
+                # 那么最后5个token (7, 8, 9, 10, 11) 写到kv_cache的顺序是
+                # (10, 11, 7, 8, 9)
+                cutoff = seq_len % win
+                self.kv_cache[:batch, cutoff:win], self.kv_cache[:batch, :cutoff] = kv[
+                    :, -win:
+                ].split([win - cutoff, cutoff], dim=1)
+
+            # 之后是压缩部分的
+            kv_compress = self.compressor(x, start_pos)
+            if kv_compress is not None:
+                kv = torch.cat([kv, kv_compress], dim=1)
+
+            # Sparse Attention
+            o = self._sparse_attention(
+                q, kv, topk_idxs, self.attn_sink, self.softmax_scale
+            )  # (batch, seq_len, n_head, head_dim)
+
+        else:
+            self.kv_cache[:batch, start_pos % win] = kv.squeeze(1)
+            self.compressor(x, start_pos)
+
+            # Sparse Attention
+            o = self._sparse_attention(
+                q, self.kv_cache[:batch], topk_idxs, self.attn_sink, self.softmax_scale
+            )  # (batch, seq_len, n_head, head_dim)
+
+        o[..., -rd:] = self.rope(o[..., -rd:], positions, inverse=True)
+        # Grouped Ouput Projection
+        o = o.view(batch, seq_len, self.output_group, -1)
+        w_o_down = self.o_down.weight.view(self.output_group, self.output_lora, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, w_o_down)
+        return self.o_up(o.flatten(2))
