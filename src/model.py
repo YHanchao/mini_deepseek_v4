@@ -1,6 +1,7 @@
 import math
 
 import torch
+
 torch.set_default_device("cuda:0")
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,7 +129,12 @@ class RotaryPositionalEmbedding(nn.Module):
         )
         return torch.clamp(linear_func, 0, 1)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor, inverse: bool = False):
+    def forward(
+        self, x: torch.Tensor, token_positions: torch.Tensor, inverse: bool = False
+    ):
+        dtype = x.dtype
+        x = x.to(torch.float32)
+
         freqs = self.freqs_cis[token_positions]
         if inverse:
             freqs = freqs.conj()
@@ -143,7 +149,7 @@ class RotaryPositionalEmbedding(nn.Module):
             freqs = freqs.view(1, x_complex.size(1), 1, x_complex.size(-1))
 
         x_rot = torch.view_as_real(x_complex * freqs).flatten(-2)
-        return x_rot.reshape(*x.shape)
+        return x_rot.reshape(*x.shape).to(dtype)
 
 
 def scaled_dot_product_attention(

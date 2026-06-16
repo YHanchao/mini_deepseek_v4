@@ -10,6 +10,7 @@ from functools import lru_cache
 from typing import Tuple, Optional, Literal
 
 import torch
+
 torch.set_default_device("cuda:0")
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,37 +27,46 @@ class DSArgs:
     dtype: str = torch.bfloat16
 
     # Basic Transformer
-    max_batch_len: int = 8
-    max_seq_len: int = 1024
+    max_batch_len: int = 4
+    max_seq_len: int = 2048
     vocab_size: int = 32000
-    d_model: int = 768
+    d_model: int = 2048
     d_ff: int = 2048
+    n_layer: int = 7
+    n_mtp_layer: int = 1
+    n_hash_layer: int = 1
 
     # MoE
-    n_experts: int = 16
-    n_shared_experts: int = 1  # DeepSeekMoE里shared expert
-    topk_experts: int = 4  # 选4个激活
-    d_moe_ff: int = 512
+    n_experts: int = 8
+    n_shared_experts: int = 1
+    topk_experts: int = 2
+    d_moe_ff: int = 2048
     route_scale: float = 1.0
 
     # mHC
     expansion_rate: int = 4
-    use_checkpoint: bool = False
+    use_checkpoint: bool = True
 
     # Attention
-    n_heads: int = 64
-    head_dim: int = 512
+    n_heads: int = 16
+    head_dim: int = 256
     rope_head_dim: int = 64
     index_head_dim: int = 128
-    index_num: int = 4
-    compress_ratio: int = 4
-    attn_rank: int = 64
-    index_topk: int = 4
+    index_num: int = 16
+    compress_ratios: Tuple[int] = (0, 0, 4, 128, 4, 128, 4, 0)
+    attn_rank: int = 512
+    index_topk: int = 256
     window_size: int = 128
-    output_group: int = 8
-    output_lora: int = 1024
+    output_group: int = 4
+    output_lora: int = 512
 
-    eps: float = 1e-5
+    # rope
+    rope_theta: float = 10000.0
+    rope_factor: float = 40.0
+    beta_fast: int = 32
+    beta_slow: int = 1
+
+    eps: float = 1e-6
 
 
 # MoE的部分是在DeepSeekMoE代码的基础上按照V4的改动做的
@@ -64,33 +74,38 @@ class DSArgs:
 
 class Gate(nn.Module):
     """
-    Compared with V3, DeepSeekV4 applies Sqrt(Softplus) instead of sigmoid
+    Compared with V3, DeepSeekV4 applies Sqrt(Softplus) instead of sigmoid.
 
-    我的个人理解：
-
-    在大模型中，gating function有个bias term
-    我能理解用这个来调节gate的weight
-
-    但是在我的复现实验中，我的计算资源很有限
-    我觉得我暂且不要考虑大量expert的负载均衡
-    也许这个可以只是简单加一个auxiliary load balancing loss来规避collapse
-    而不是维护bias weight
+    bias 用于负载均衡：overloaded expert 降低 bias，减少被选中概率；
+    underloaded expert 提高 bias，增加被选中概率。
+    bias 仅影响 expert 选择（topk），不影响路由权重。
     """
 
     def __init__(self, args: DSArgs):
         super().__init__()
         self.topk_experts = args.topk_experts
         self.route_scale = args.route_scale
+        self.n_experts = args.n_experts
 
         self.route = model.Linear(
             args.d_model, args.n_experts, device=args.device, dtype=torch.float32
         )
+        self.bias = nn.Parameter(torch.zeros(args.n_experts, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        scores = self.route(x)
+        scores = self.route(x.float())
         scores = torch.sqrt(F.softplus(scores))
-        weights, indices = torch.topk(scores, self.topk_experts, dim=-1)  # (T, num_exp)
-        weights *= self.route_scale
+        original_scores = scores
+
+        # bias 仅用于 expert 选择，不影响权重
+        scores = scores + self.bias
+
+        _, indices = torch.topk(scores, self.topk_experts, dim=-1)
+
+        # 权重取自无 bias 的原始分数
+        weights = original_scores.gather(1, indices)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights * self.route_scale
         return weights.type_as(x), indices
 
 
@@ -98,18 +113,29 @@ class HashGate(nn.Module):
     def __init__(self, args: DSArgs):
         super().__init__()
         self.n_experts = args.n_experts
+        self.topk = args.topk_experts
         self.route_scale = args.route_scale
 
     def forward(self, token_ids: torch.Tensor):
         """
-        前面几层直接用HashGate来负载均衡
+        前面几层直接用 HashGate 来负载均衡。
+
+        用确定性 hash 给每个 token 映射 topk 个不同的 expert，
+        等价于维护了一张 (vocab_size, topk) 的随机映射表。
         """
-        indices = (token_ids % self.n_experts).view(-1, 1)
+        T = token_ids.numel()
+        # 对每个 rank 用不同的质数乘子做 hash，保证 topk 个 expert 互不相同
+        indices = torch.stack(
+            [
+                (token_ids * (157 + i * 199) + i * 1063) % self.n_experts
+                for i in range(self.topk)
+            ],
+            dim=-1,
+        )  # (T, topk)
+        # 均匀权重，归一化后总和为 route_scale
+        weight = self.route_scale / self.topk
         weights = torch.full(
-            (indices.size(0), 1),
-            self.route_scale,
-            dtype=torch.float32,
-            device=indices.device,
+            (T, self.topk), weight, dtype=torch.float32, device=indices.device
         )
         return weights, indices
 
@@ -152,15 +178,14 @@ class DSMoE(nn.Module):
             dtype=args.dtype,
         )
 
-    def forward(
-        self, x: torch.Tensor, token_ids: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         # 似乎tokenwise的处理（或者说，每个token独立的操作）
         # 最好一开始就flatten到tokenwise上
         # 最后再变回去原来的shape
-        y = torch.zeros_like(x)
+        token_ids: Optional[torch.Tensor] = kwargs.get("token_ids", None)
         shape = x.size()
         x = x.view(-1, self.d_model)
+        y = torch.zeros_like(x)
 
         # weights, indices: shape (T, num_experts)
         if self.use_hash_routing:
@@ -226,41 +251,14 @@ class ManifoldHyperConnections(nn.Module):
         self.bias_post = nn.Parameter(torch.zeros(self.n))
         self.bias_res = nn.Parameter(torch.zeros(self.n, self.n))
 
-        self.norm = model.RMSNorm(
-            args.d_model * self.n, device=args.device, dtype=args.dtype
+        self.hc_norm_eps = args.eps
+        self.block_norm = model.RMSNorm(
+            args.d_model, args.eps, device=args.device, dtype=args.dtype
         )
 
-    # ------------------------------------------------------------------
-    # Boundary helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def expand_streams(x: torch.Tensor, n: int) -> torch.Tensor:
-        """(batch, seq_len, d) -> (batch * n, seq_len, d)
-
-        Creates n identical copies of each sequence. The copies diverge
-        after the first mHC layer's depth connection applies h_post.
-        """
-        batch, seq_len, d = x.shape
-        return (
-            x.unsqueeze(1).expand(batch, n, seq_len, d).reshape(batch * n, seq_len, d)
-        )
-
-    @staticmethod
-    def reduce_streams(x: torch.Tensor, n: int) -> torch.Tensor:
-        """(batch * n, seq_len, d) -> (batch, seq_len, d)
-
-        Averages the n (now genuinely different) streams back into one.
-        Called once after the final mHC layer.
-        """
-        bn, seq_len, d = x.shape
-        return x.view(bn // n, n, seq_len, d).mean(dim=1)
-
-    # ------------------------------------------------------------------
-    # Sinkhorn-Knopp (log-space, column-first per the paper)
-    # ------------------------------------------------------------------
-
-    def sinkhorn_knopp(self, logits: torch.Tensor, iters: int = 20) -> torch.Tensor:
+    def sinkhorn_knopp(
+        self, logits: torch.Tensor, iters: int = 20, eps: float = 1e-6
+    ) -> torch.Tensor:
         """Log-space Sinkhorn-Knopp normalization.
 
         Matches Eq. (9): T_c (column norm) first, then T_r (row norm).
@@ -270,11 +268,7 @@ class ManifoldHyperConnections(nn.Module):
         for _ in range(iters):
             logits = logits - logits.logsumexp(dim=-2, keepdim=True)  # T_c: columns
             logits = logits - logits.logsumexp(dim=-1, keepdim=True)  # T_r: rows
-        return logits.exp()
-
-    # ------------------------------------------------------------------
-    # Kernel computation (the lightweight, recomputable part)
-    # ------------------------------------------------------------------
+        return logits.exp() + eps
 
     def _compute_kernels(
         self, x_normed: torch.Tensor
@@ -318,28 +312,24 @@ class ManifoldHyperConnections(nn.Module):
         """Mix the n residual streams into a single branch input + updated residuals.
 
         Args:
-            x:      (batch * n, seq_len, d_model)
+            x:      (batch, seq_len, n, d_model)
             h_pre:  (batch, seq_len, n)
             h_res:  (batch, seq_len, n, n)
             batch:  original batch size (without stream multiplier)
 
         Returns:
             branch_input:    (batch, seq_len, d_model) – weighted combination
-            mixed_residuals: (batch * n, seq_len, d_model) – h_res-mixed streams
+            mixed_residuals: (batch, seq_len, n, d_model) – h_res-mixed streams
         """
         seq_len = x.shape[1]
 
-        # (b*n, s, d) -> (b, s, n, d)
-        x_by_seq = x.view(batch, self.n, seq_len, self.d_model).permute(0, 2, 1, 3)
-
         # Pre-gate: weighted sum over n streams -> single block input
-        branch_input = torch.einsum("bsn,bsnd->bsd", h_pre, x_by_seq)
+        branch_input = torch.einsum("bsn,bsnd->bsd", h_pre, x)
 
         # Residual mix via doubly stochastic matrix
-        mixed_by_seq = torch.einsum("bsij,bsjd->bisd", h_res, x_by_seq)
-        mixed_residuals = mixed_by_seq.reshape(batch * self.n, seq_len, self.d_model)
+        mixed_by_seq = torch.einsum("bsij,bsjd->bsid", h_res, x)
 
-        return branch_input, mixed_residuals
+        return branch_input, mixed_by_seq
 
     # ------------------------------------------------------------------
     # Depth connection – distributes block output AFTER the block
@@ -356,18 +346,15 @@ class ManifoldHyperConnections(nn.Module):
 
         Args:
             branch_output:   (batch, seq_len, d_model)
-            mixed_residuals: (batch * n, seq_len, d_model)
+            mixed_residuals: (batch, seq_len, n, d_model)
             h_post:          (batch, seq_len, n)
             batch:           original batch size
 
         Returns:
-            (batch * n, seq_len, d_model) – updated multi-stream representation
+            (batch, seq_len, n, d_model) – updated multi-stream representation
         """
-        seq_len = branch_output.shape[1]
 
-        # Distribute: einsum outputs (b, n, s, d) → reshape to (b*n, s, d)
-        post_block = torch.einsum("bsd,bsn->bnsd", branch_output, h_post)
-        post_block = post_block.reshape(batch * self.n, seq_len, self.d_model)
+        post_block = torch.einsum("bsd,bsn->bsnd", branch_output, h_post)
 
         return mixed_residuals + post_block
 
@@ -379,17 +366,18 @@ class ManifoldHyperConnections(nn.Module):
         """Multi-stream mHC forward.
 
         Args:
-            x: (batch * n, seq_len, d_model)
+            x: (batch, seq_len, n, d_model)
 
         Returns:
-            (batch * n, seq_len, d_model) — streams preserved, no collapse.
+            (batch, seq_len, n, d_model) — streams preserved, no collapse.
         """
-        bn, seq_len, _ = x.shape
-        batch = bn // self.n
+        batch, seq_len, n, d = x.shape
 
-        # Flatten streams for kernel computation: (b*n, s, d) -> (b, s, n*d)
+        # Flatten streams for kernel computation: (b, s, n, d) -> (b, s, n*d)
         x_flat = x.view(batch, seq_len, self.flatten_dim)
-        x_normed = self.norm(x_flat)
+        # 与官方一致：用 rsqrt 做归一化，无可学习参数
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.hc_norm_eps)
+        x_normed = x_flat * rsqrt
 
         if self.training and self.use_checkpoint:
             h_pre, h_post, h_res = torch.utils.checkpoint.checkpoint(
@@ -399,6 +387,7 @@ class ManifoldHyperConnections(nn.Module):
             h_pre, h_post, h_res = self._compute_kernels(x_normed)
 
         branch_input, mixed_residuals = self._width_connection(x, h_pre, h_res, batch)
+        branch_input = self.block_norm(branch_input)
         branch_output = self.block(branch_input, *args, **kwargs)
         return self._depth_connection(branch_output, mixed_residuals, h_post, batch)
 
@@ -424,6 +413,7 @@ class Compressor(nn.Module):
         self.rope_head_dim = args.rope_head_dim
         self.rope = rope
         self.overlap = compress_ratio == 4
+        self.eps = args.eps
         coff = 1 + self.overlap  # 2 when overlap, 1 otherwise
 
         # 要同时维护Ca, Cb, Za, Zb，所以是两倍的head_dim（仅overlap时）
@@ -441,12 +431,16 @@ class Compressor(nn.Module):
                 device=args.device,
             )
         )
-        self.norm = model.RMSNorm(self.head_dim, device=args.device)
+        self.norm = model.RMSNorm(
+            self.head_dim, self.eps, device=args.device, dtype=args.dtype
+        )
 
         # 解码阶段的状态缓存
         # assigned lazily from Attention.kv_cache
         self.kv_cache: torch.Tensor = None
         # 解码阶段用到的状态缓存，分别存储未压缩的 KV 和 score
+        # 在CSA中会用交替两块的缓存构造compress kv
+        # 但HCA直接做了非常狠的压缩，没有做交替，所以只有在CSA中才保留双份的
         self.register_buffer(
             "kv_state",
             torch.zeros(
@@ -493,7 +487,12 @@ class Compressor(nn.Module):
         """
         assert self.kv_cache is not None
         batch, seq_len, _ = x.shape
-        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
+        ratio, overlap, d, rd = (
+            self.compress_ratio,
+            self.overlap,
+            self.head_dim,
+            self.rope_head_dim,
+        )
 
         dtype = x.dtype
         x = x.float()  # 压缩需要 fp32
@@ -579,7 +578,9 @@ class Compressor(nn.Module):
                         ],
                         dim=1,
                     )
-                    kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                    kv = (kv_state * score_state.softmax(dim=1)).sum(
+                        dim=1, keepdim=True
+                    )
 
                     self.kv_state[:batch, :ratio] = self.kv_state[:batch, ratio:]
                     self.score_state[:batch, :ratio] = self.score_state[:batch, ratio:]
@@ -589,15 +590,15 @@ class Compressor(nn.Module):
                 self.score_state[:batch, index] = score.squeeze(1) + self.bias[index]
 
                 if should_compress:
-                    kv = (self.kv_state[:batch] * self.score_state[:batch].softmax(dim=1)).sum(
-                        dim=1, keepdim=True
-                    )
+                    kv = (
+                        self.kv_state[:batch] * self.score_state[:batch].softmax(dim=1)
+                    ).sum(dim=1, keepdim=True)
 
         if not should_compress:
             # 没凑够ratio个token，不压缩
             return None
 
-        kv = self.norm(kv)
+        kv = self.norm(kv.to(dtype))
 
         if start_pos == 0:
             # 预填充：每隔 ratio 个 token 取 start of each block 作为代表位置
@@ -620,10 +621,15 @@ class Compressor(nn.Module):
 
 
 class Indexer(nn.Module):
-    def __init__(self, args: DSArgs, rope: model.RotaryPositionalEmbedding):
+    def __init__(
+        self,
+        args: DSArgs,
+        rope: model.RotaryPositionalEmbedding,
+        compress_ratio: int = 4,
+    ):
         super().__init__()
         self.d_model = args.d_model
-        self.compress_ratio = args.compress_ratio
+        self.compress_ratio = compress_ratio
         self.rope_head_dim = args.rope_head_dim
         self.index_head_dim = args.index_head_dim
         self.index_num = args.index_num
@@ -650,7 +656,7 @@ class Indexer(nn.Module):
             "kv_cache",
             torch.zeros(
                 args.max_batch_len,
-                args.max_seq_len // args.compress_ratio,
+                args.max_seq_len // self.compress_ratio,
                 self.index_head_dim,
                 device=args.device,
             ),
@@ -717,11 +723,16 @@ class Indexer(nn.Module):
 
             # left tensor: (seq_len, n_block)
             # _left[i] = [0, ..., n_block - 1] for each i
-            _left = torch.arange(seq_len // m, device=index_score.device).repeat(seq_len, 1)
+            _left = torch.arange(seq_len // m, device=index_score.device).repeat(
+                seq_len, 1
+            )
 
             # right tensor: (seq_len, 1)
             # _right[..., 0] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, ..., n_block]
-            _right = torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1) // m
+            _right = (
+                torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1)
+                // m
+            )
 
             mask = _left >= _right
             index_score += torch.where(mask, float("-inf"), 0)
@@ -732,7 +743,11 @@ class Indexer(nn.Module):
             # 在序列一开始时，上一层会全都fill为-inf
             # 那么返回的topk是没有意义的
             # 所以进一步筛选，保证topk_idx取值合理
-            mask = topk_idxs >= torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1) // m
+            mask = (
+                topk_idxs
+                >= torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1)
+                // m
+            )
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
         else:
             topk_idxs += offset
@@ -740,10 +755,12 @@ class Indexer(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: DSArgs, rope: model.RotaryPositionalEmbedding):
+    def __init__(
+        self, args: DSArgs, rope: model.RotaryPositionalEmbedding, layer_id: int
+    ):
         super().__init__()
 
-        self.compress_ratio = args.compress_ratio
+        self.compress_ratio = args.compress_ratios[layer_id]
         self.index_num = args.index_num
         self.n_heads = args.n_heads
         self.eps = args.eps
@@ -764,7 +781,12 @@ class Attention(nn.Module):
         )
         self.register_buffer(
             "kv_cache",
-            torch.zeros(args.max_batch_len, self.kv_cache_size, self.head_dim, device=args.device),
+            torch.zeros(
+                args.max_batch_len,
+                self.kv_cache_size,
+                self.head_dim,
+                device=args.device,
+            ),
             persistent=False,
         )
 
@@ -772,7 +794,7 @@ class Attention(nn.Module):
             self.d_model, self.attn_rank, device=args.device, dtype=args.dtype
         )
         self.rms_norm_q = model.RMSNorm(
-            self.attn_rank, device=args.device, dtype=args.dtype
+            self.attn_rank, self.eps, device=args.device, dtype=args.dtype
         )
         self.w_uq = model.Linear(
             self.attn_rank,
@@ -783,11 +805,13 @@ class Attention(nn.Module):
 
         self.weight_kv = model.Linear(self.d_model, self.head_dim)
         self.rms_norm_kv = model.RMSNorm(
-            self.head_dim, device=args.device, dtype=args.dtype
+            self.head_dim, self.eps, device=args.device, dtype=args.dtype
         )
 
         self.rope = rope
-        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32, device=args.device))
+        self.attn_sink = nn.Parameter(
+            torch.zeros(self.n_heads, device=args.device)
+        )
 
         self.o_down = model.Linear(
             self.n_heads * self.head_dim // self.output_group,
@@ -804,9 +828,14 @@ class Attention(nn.Module):
 
         self.compressor = (
             Compressor(args, self.head_dim, self.compress_ratio, rope)
-            if self.compress_ratio else None
+            if self.compress_ratio
+            else None
         )
-        self.indexer = Indexer(args, rope) if self.compress_ratio == 4 else None
+        self.indexer = (
+            Indexer(args, rope, self.compress_ratio)
+            if self.compress_ratio == 4
+            else None
+        )
 
     def _get_window_topk_id(self, batch: int, seq_len: int, start_pos: int):
         """
@@ -855,7 +884,6 @@ class Attention(nn.Module):
 
         return matrix.unsqueeze(0).expand(batch, -1, -1)
 
-    @lru_cache(2)
     def _get_compress_topk_id(
         self, batch: int, seq_len: int, start_pos: int, offset: int
     ):
@@ -943,7 +971,8 @@ class Attention(nn.Module):
         output = torch.einsum("bmhk,bmkd->bmhd", weight, v)
         return output
 
-    def forward(self, x: torch.Tensor, start_pos: int):
+    def forward(self, x: torch.Tensor, **kwargs):
+        start_pos = kwargs.get("start_pos", 0)
         batch, seq_len, _ = x.size()
         m = self.compress_ratio
         rd = self.rope_head_dim
@@ -1031,3 +1060,197 @@ class Attention(nn.Module):
         w_o_down = self.o_down.weight.view(self.output_group, self.output_lora, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, w_o_down)
         return self.o_up(o.flatten(2))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self, args: DSArgs, rope: model.RotaryPositionalEmbedding, layer_id: int
+    ):
+        super().__init__()
+
+        self.rope = rope
+        self.use_hash_routing = layer_id < args.n_hash_layer
+        self.attention = Attention(args, self.rope, layer_id)
+        self.ffn = DSMoE(args, use_hash_routing=self.use_hash_routing)
+
+        self.attn_hc = ManifoldHyperConnections(args, self.attention)
+        self.ffn_hc = ManifoldHyperConnections(args, self.ffn)
+
+    def forward(
+        self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Input:
+        - x: torch.Tensor of shape (batch, seq, hc_num, d_model)
+        """
+        x = self.attn_hc(x, start_pos=start_pos)
+        x = self.ffn_hc(x, token_ids=input_ids)
+        return x
+
+
+class PredictionHead(nn.Module):
+    def __init__(self, args: DSArgs, norm_eps: float = 1e-6, hc_eps: float = 1e-6):
+        super().__init__()
+
+        self.d_model = args.d_model
+        self.eps = args.eps
+        self.hc_num = args.expansion_rate
+        self.norm_eps = norm_eps
+        self.hc_eps = hc_eps
+        self.vocab_size = args.vocab_size
+
+        self.weight = model.Linear(
+            self.d_model * self.hc_num,
+            self.hc_num,
+            device=args.device,
+            dtype=torch.float32,
+        )
+        self.logit = model.Linear(
+            self.d_model, self.vocab_size, dtype=torch.float32, device=args.device
+        )
+        self.norm = model.RMSNorm(
+            self.d_model, self.eps, device=args.device, dtype=args.dtype
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        Input:
+
+        x: (batch, seq, hc_num, d_model)
+        """
+
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()  # (b, s, h*d)
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+
+        weight = torch.sigmoid(self.weight(x) * rsqrt) + self.hc_eps  # (b, s, h)
+        x = torch.sum(weight.unsqueeze(-1) * x.view(shape), dim=2).to(
+            dtype
+        )  # (b, s, d)
+        x = self.norm(x)
+        logits = self.logit(x.float())
+        return logits
+
+
+class MTPBlock(TransformerBlock):
+    def __init__(
+        self,
+        args: DSArgs,
+        rope: model.RotaryPositionalEmbedding,
+        embedding: model.Embedding,
+        prediction_head: PredictionHead,
+        layer_id: int,
+    ):
+        super().__init__(args, rope, layer_id)
+
+        self.eps = args.eps
+
+        self.embedding = embedding
+        self.prediction_head = prediction_head
+
+        self.embed_proj = model.Linear(args.d_model, args.d_model)
+        self.x_proj = model.Linear(args.d_model, args.d_model)
+
+        self.embed_norm = model.RMSNorm(
+            args.d_model, self.eps, device=args.device, dtype=args.dtype
+        )
+        self.x_norm = model.RMSNorm(
+            args.d_model, self.eps, device=args.device, dtype=args.dtype
+        )
+
+    def forward(self, x: torch.Tensor, start_pos: int, token_ids: torch.Tensor):
+        # x: [b,s,hc,d]
+        embedding = self.embedding(token_ids)
+        embedding = self.embed_norm(embedding)
+        x = self.x_norm(x)
+
+        x = self.embed_proj(embedding).unsqueeze(2) + self.x_proj(x)
+        x = super().forward(x, start_pos, token_ids)
+
+        logits = self.prediction_head(x)
+
+        return logits, x
+
+
+class DeepSeekV4(nn.Module):
+    def __init__(self, args: DSArgs):
+        super().__init__()
+
+        self.max_seq_len = args.max_seq_len
+        self.hc_num = args.expansion_rate
+        self.eps = args.eps
+
+        self.vocab_size = args.vocab_size
+
+        self.d_model = args.d_model
+
+        self.rope = model.RotaryPositionalEmbedding(
+            args.rope_theta,
+            args.rope_head_dim,
+            args.max_seq_len,
+            factor=args.rope_factor,
+            beta_fast=args.beta_fast,
+            beta_slow=args.beta_slow,
+            device=args.device,
+        )
+
+        self.embedding = model.Embedding(
+            self.vocab_size, self.d_model, device=args.device, dtype=args.dtype
+        )
+        self.layers = nn.ModuleList()
+
+        for layer_id in range(args.n_layer):
+            self.layers.append(TransformerBlock(args, self.rope, layer_id))
+
+        self.prediction = PredictionHead(args, self.eps, self.eps)
+
+        self.mtp_layers = nn.ModuleList()
+        for layer_id in range(args.n_mtp_layer):
+            self.mtp_layers.append(
+                MTPBlock(
+                    args,
+                    self.rope,
+                    self.embedding,
+                    self.prediction,
+                    layer_id + args.n_layer,
+                )
+            )
+
+    def forward(self, token_ids: torch.Tensor, start_pos: int = 0):
+        embed = self.embedding(token_ids)  # (b, s, d)
+        h = embed.unsqueeze(2).repeat(1, 1, self.hc_num, 1)  # (b, s, h, d)
+
+        for layer in self.layers:
+            h = layer(h, start_pos, token_ids)
+
+        # Next token prediction
+        ntp = self.prediction(h)
+
+        # Multi token prediction
+        mtp_res = []
+        for layer in self.mtp_layers:
+            mtp, h = layer(h, start_pos, token_ids)
+            mtp_res.append(mtp)
+
+        return ntp, mtp_res
+
+
+if __name__ == "__main__":
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    torch.manual_seed(0)
+    args = DSArgs(n_hash_layer=0)
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    dpsk = DeepSeekV4(args)
+
+    ntp, mtp_list = dpsk(x)
+    print("prefill ntp:", ntp.size(), "mtp:", [m.size() for m in mtp_list])
+    for i in range(128, 131):
+        ntp, mtp_list = dpsk(x[:, 0:1], i)
+        print(f"decode pos {i}: ntp {ntp.size()}, mtp {[m.size() for m in mtp_list]}")
+
+    h = torch.randn(2, 128, args.expansion_rate, args.d_model)
+    logits, _ = dpsk.mtp_layers[0](h, 0, x)
+    print("mtp prefill:", logits.size())
+    logits, _ = dpsk.mtp_layers[0](h[:, 0:1], 1, x[:, 0:1])
+    print("mtp decode:", logits.size())
