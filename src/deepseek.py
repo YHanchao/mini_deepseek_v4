@@ -853,45 +853,26 @@ class Attention(nn.Module):
         """
         Output: Tensor of shape (batch_size, seq_len, window_size)
         """
+        dev = self.kv_cache.device
         if start_pos >= self.window_size - 1:
-            # 这个时候kv_cache前win个保存的形如 (10, 11, 7, 8, 9)
-            # 预期返回(2, 3, 4, 0, 1)
             start_pos %= self.window_size
             matrix = torch.cat(
                 [
-                    torch.arange(start_pos + 1, self.window_size),
-                    torch.arange(0, start_pos + 1),
+                    torch.arange(start_pos + 1, self.window_size, device=dev),
+                    torch.arange(0, start_pos + 1, device=dev),
                 ],
                 dim=0,
             )
         elif start_pos > 0:
-            # 这个时候预期返回(0,1,2,-1,-1)
             matrix = F.pad(
-                torch.arange(start_pos + 1),
+                torch.arange(start_pos + 1, device=dev),
                 (0, self.window_size - start_pos - 1),
                 value=-1,
             )
         else:
-            # prefill and training
-            # 预期返回
-            # [[ 0, -1, -1, -1, -1],
-            # [ 0,  1, -1, -1, -1],
-            # [ 0,  1,  2, -1, -1],
-            # [ 0,  1,  2,  3, -1],
-            # [ 0,  1,  2,  3,  4],
-            # [ 1,  2,  3,  4,  5],
-            # [ 2,  3,  4,  5,  6],
-            # [ 3,  4,  5,  6,  7],
-            # [ 4,  5,  6,  7,  8],
-            # [ 5,  6,  7,  8,  9],
-            # [ 6,  7,  8,  9, 10],
-            # [ 7,  8,  9, 10, 11]]
-
-            # (0, 1, 2, ..., 10, 11)
-            base = torch.arange(seq_len).unsqueeze(1)
-            # (0,0,0,0,0,1,2,3,4,5,6,7)
+            base = torch.arange(seq_len, device=dev).unsqueeze(1)
             start = (base - self.window_size + 1).clamp(0)
-            matrix = start + torch.arange(min(seq_len, self.window_size))
+            matrix = start + torch.arange(min(seq_len, self.window_size), device=dev)
             matrix = torch.where(matrix > base, -1, matrix)
 
         return matrix.unsqueeze(0).expand(batch, -1, -1)
@@ -922,16 +903,13 @@ class Attention(nn.Module):
          [ 1,  2, -1]]
         第t行能看到所有 block_index < floor(t/ratio) 的压缩块。
         """
+        dev = self.kv_cache.device
         ratio = self.compress_ratio
         if start_pos > 0:
-            # decode：返回目前已压缩的所有块索引
-            matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
+            matrix = torch.arange(0, (start_pos + 1) // ratio, device=dev) + offset
         else:
-            # prefill / training：因果掩码，t位置不能看到未来的压缩块
-            # left: (seq_len, n_blocks) — [0,0,0,0, 1,1,1,1, 2,2,2,2]
-            matrix = torch.arange(seq_len // ratio).repeat(seq_len, 1)
-            # right: (seq_len, 1) — floor(t/ratio)
-            mask = matrix >= torch.arange(1, seq_len + 1).unsqueeze(1) // ratio
+            matrix = torch.arange(seq_len // ratio, device=dev).repeat(seq_len, 1)
+            mask = matrix >= torch.arange(1, seq_len + 1, device=dev).unsqueeze(1) // ratio
             matrix = torch.where(mask, -1, matrix + offset)
 
         return matrix.unsqueeze(0).expand(batch, -1, -1)

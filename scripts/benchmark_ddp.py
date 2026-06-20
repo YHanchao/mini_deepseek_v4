@@ -110,10 +110,7 @@ def train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
                   for (iscore, wc, idx) in idx_data)
     lm_loss = ntp_loss + 0.3 * mtp_loss
 
-    # Two backward phases (Eq. 3-4: separate optimization)
-    ddp_model.require_backward_grad_sync = False  # skip DDP sync for KL loss
     (0.5 * kl_loss).backward(retain_graph=True)
-    ddp_model.require_backward_grad_sync = True   # enable DDP sync for LM loss
     lm_loss.backward()
 
     grad_clip(ddp_model.parameters(), max_norm=1.0)
