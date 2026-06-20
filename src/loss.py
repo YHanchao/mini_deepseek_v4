@@ -52,8 +52,9 @@ def indexer_kl_loss(index_score, compress_topk_idxs, weight_compress):
         scalar KL loss, or 0.0 if no indexer data is available
     """
     if index_score is None or compress_topk_idxs is None or weight_compress is None:
-        return torch.tensor(0.0, device=weight_compress.device if weight_compress is not None else (
-            index_score.device if index_score is not None else None))
+        return torch.tensor(0.0, device=index_score.device if index_score is not None else
+                           (weight_compress.device if weight_compress is not None else
+                            torch.cuda.current_device()))
 
     b, s, n_heads, topk = weight_compress.shape
 
