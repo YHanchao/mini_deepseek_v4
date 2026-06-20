@@ -98,8 +98,8 @@ def build_model_and_opt(args_dict, local_rank):
 
 
 def train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
-               batch_size, seq_len):
-    """Single training step: forward → loss → backward → grad_clip → optimizer."""
+               batch_size, seq_len, with_optimizer=False):
+    """Single training step: forward → loss → backward → [optimizer]."""
     ids = torch.randint(0, args.vocab_size, (batch_size, seq_len),
                         device=torch.cuda.current_device())
     ntp, mtp_list, idx_data = ddp_model(ids)
@@ -110,13 +110,14 @@ def train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
                   for (iscore, wc, idx) in idx_data)
     lm_loss = ntp_loss + 0.3 * mtp_loss
 
-    total_loss = lm_loss + 0.5 * kl_loss
-    total_loss.backward()
+    (0.5 * kl_loss).backward(retain_graph=True)
+    lm_loss.backward()
 
-    grad_clip(ddp_model.parameters(), max_norm=1.0)
-    muon_opt.step()
-    adamw_opt.step()
-    idx_opt.step()
+    if with_optimizer:
+        grad_clip(ddp_model.parameters(), max_norm=1.0)
+        muon_opt.step()
+        adamw_opt.step()
+        idx_opt.step()
     ddp_model.zero_grad()
 
 
@@ -147,14 +148,18 @@ def benchmark_config(name, cfg_overrides, rank, world_size, local_rank,
               f"{format_params(trainable)} trainable")
         print(f"  GPU memory after build: {mem_mb:.0f} MB")
 
-    # Warmup
+    # Warmup (no optimizer — avoids autograd state issues between steps)
     for _ in range(warmup):
         train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
-                   batch_size, seq_len)
+                   batch_size, seq_len, with_optimizer=False)
     torch.cuda.synchronize()
-    dist.barrier()  # ensure all GPUs done before timing
+    dist.barrier()
 
-    # Profile
+    # Verify one step with optimizer works
+    train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
+               batch_size, seq_len, with_optimizer=True)
+
+    # Profile (no optimizer — pure forward+backward throughput)
     if rank == 0:
         print(f"  Profiling ({profile} steps)...")
 
@@ -164,7 +169,7 @@ def benchmark_config(name, cfg_overrides, rank, world_size, local_rank,
     start_evt.record()
     for _ in range(profile):
         train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
-                   batch_size, seq_len)
+                   batch_size, seq_len, with_optimizer=False)
     end_evt.record()
     torch.cuda.synchronize()
 

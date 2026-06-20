@@ -68,12 +68,17 @@ def indexer_kl_loss(index_score, compress_topk_idxs, weight_compress):
     pred = index_score.gather(-1, idx)  # (b, s, topk)
     pred = pred.masked_fill(mask, float("-inf"))
 
-    # KL(target || softmax(pred))
-    log_pred = torch.log_softmax(pred, dim=-1)  # (b, s, topk)
+    # Positions where ALL blocks are causally masked produce log_softmax(-inf) = NaN.
+    # These positions have target = 0 anyway, so set log_pred to 0 to avoid NaN
+    # in both forward and backward (LogSoftmaxBackward chokes on NaN input).
+    all_masked = mask.all(dim=-1, keepdim=True)  # (b, s, 1)
+    pred_safe = torch.where(all_masked, 0.0, pred)
+
+    log_pred = torch.log_softmax(pred_safe, dim=-1)  # (b, s, topk)
     kl = target * (torch.log(target + 1e-8) - log_pred)  # (b, s, topk)
-    kl = kl.masked_fill(mask | torch.isnan(kl), 0.0)
+    kl = kl.masked_fill(mask | all_masked, 0.0)
     kl = kl.sum(dim=-1)  # (b, s)
 
     # Only count positions that attend to at least one compressed block
     valid = target.sum(dim=-1) > 1e-8  # (b, s)
-    return kl[valid].mean() if valid.any() else torch.tensor(0.0)
+    return kl[valid].mean() if valid.any() else torch.tensor(0.0, device=index_score.device)
