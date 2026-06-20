@@ -614,9 +614,9 @@ class Compressor(nn.Module):
         )
 
         if start_pos == 0:
-            self.kv_cache[:batch, : seq_len // ratio] = kv
+            self.kv_cache[:batch, : seq_len // ratio] = kv.detach()
         else:
-            self.kv_cache[:batch, start_pos // ratio] = kv.squeeze(1)
+            self.kv_cache[:batch, start_pos // ratio] = kv.detach().squeeze(1)
         return kv
 
 
@@ -680,15 +680,10 @@ class Indexer(nn.Module):
         所以这里要同时输入原始的x和Attention部分创建好的query c_t^Q
 
         Returns:
-            (topk_idxs, index_score) — topk_idxs for sparse attention gather,
-            index_score (before topk) for KL auxiliary loss.
+            (topk_idxs, local_topk_idxs, index_score) — topk_idxs for sparse attention
+            gather, local_topk_idxs for KL loss gather indexing, and index_score
+            (before topk) for KL auxiliary loss.
         """
-        # Detach inputs: Indexer is trained separately via KL loss.
-        # This detaches the Indexer subgraph from the main model,
-        # so LM loss backward and KL loss backward see disjoint graphs.
-        hidden_state = hidden_state.detach()
-        query = query.detach()
-
         batch, seq_len, _ = hidden_state.size()
         m = self.compress_ratio
         rd = self.rope_head_dim
@@ -697,73 +692,88 @@ class Indexer(nn.Module):
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
 
-        # Eq.14
-        # index_query: (batch, len, n_index, d_index)
-        index_query = self.weight_iuq(query)
-        index_query = index_query.unflatten(-1, (self.index_num, self.index_head_dim))
+        # K_s^{IComp} — detach hidden_state so KL loss trains Compressor
+        # params but does not flow back to the main model.
+        kv_compress = self.compressor(hidden_state.detach(), start_pos)
 
-        # Obtain K_s^{IComp}
-        # K is stored in kv_cache
-        self.compressor(hidden_state, start_pos)
+        # === Phase 1: topk indices in no_grad (no autograd nodes) ===
+        with torch.no_grad():
+            # Eq.14
+            index_query = self.weight_iuq(query)
+            index_query = index_query.unflatten(-1, (self.index_num, self.index_head_dim))
 
-        # Compressor里面的hidden state被旋转了一次，这里同样旋转
-        # Apply RoPE
-        positions = torch.arange(
-            start_pos, start_pos + seq_len, device=index_query.device
-        )
-        index_query = torch.cat([index_query[..., :-rd], self.rope(index_query[..., -rd:], positions)], dim=-1)
-
-        # Eq.15
-        # Eq15~16这里类似于做了一个小的attention
-        # 为了数值稳定性，除掉一个\sqrt{d * n}
-        # weights: (b, s, n_index)
-        weights = self.weight_h(hidden_state) * self.attention_scale
-
-        # q_{th}^I K_s^{IComp}
-        index_score = torch.einsum(
-            "bsnd,bld->bsnl", index_query, self.kv_cache[:batch, : end_pos // m]
-        )
-
-        # I: (batch, seq, block_num)
-        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=-2)
-
-        if start_pos == 0:
-            # Eq.17: 训练and prefill 选topk时不能选未来的，因果掩码
-            # Implement s < floor(t / m)
-
-            # left tensor: (seq_len, n_block)
-            # _left[i] = [0, ..., n_block - 1] for each i
-            _left = torch.arange(seq_len // m, device=index_score.device).repeat(
-                seq_len, 1
+            # Apply RoPE
+            positions = torch.arange(
+                start_pos, start_pos + seq_len, device=index_query.device
+            )
+            index_query = torch.cat(
+                [index_query[..., :-rd], self.rope(index_query[..., -rd:], positions)],
+                dim=-1,
             )
 
-            # right tensor: (seq_len, 1)
-            # _right[..., 0] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, ..., n_block]
-            _right = (
-                torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1)
-                // m
+            # Eq.15-16: compute index_score for topk selection
+            weights = self.weight_h(hidden_state) * self.attention_scale
+            idx_score = torch.einsum(
+                "bsnd,bld->bsnl", index_query,
+                self.kv_cache[:batch, : end_pos // m]
             )
+            idx_score = (idx_score.relu() * weights.unsqueeze(-1)).sum(dim=-2)
 
-            mask = _left >= _right
-            index_score = index_score + torch.where(mask, float("-inf"), 0)
+            if start_pos == 0:
+                _left = torch.arange(seq_len // m, device=idx_score.device).repeat(seq_len, 1)
+                _right = (
+                    torch.arange(1, seq_len + 1, device=idx_score.device).unsqueeze(1) // m
+                )
+                idx_score = idx_score + torch.where(_left >= _right, float("-inf"), 0)
 
-        # Detach before topk: topk_idxs are only used as gather indices
-        # in sparse attention, no gradient flows through this path.
-        topk_idxs = index_score.detach().topk(min(self.index_topk, end_pos // m), dim=-1)[1]
+            topk_idxs = idx_score.topk(
+                min(self.index_topk, end_pos // m), dim=-1
+            )[1]
 
+        # Extract local_topk_idxs from no_grad results
         if start_pos == 0:
-            mask = (
+            causal_mask = (
                 topk_idxs
-                >= torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1)
-                // m
+                >= torch.arange(1, seq_len + 1, device=idx_score.device).unsqueeze(1) // m
             )
             local_topk_idxs = topk_idxs.clone()
-            topk_idxs = torch.where(mask, -1, local_topk_idxs + offset)
-            local_topk_idxs = torch.where(mask, -1, local_topk_idxs)
+            topk_idxs = torch.where(causal_mask, -1, local_topk_idxs + offset)
+            local_topk_idxs = torch.where(causal_mask, -1, local_topk_idxs)
         else:
             local_topk_idxs = topk_idxs.clone()
             topk_idxs += offset
-        return topk_idxs, local_topk_idxs, index_score
+
+        # === Phase 2: index_score WITH grad for KL loss ===
+        # Detached inputs → KL backward only reaches Indexer params.
+        # This is a SEPARATE computation from Phase 1's no_grad path,
+        # so the autograd graphs never share nodes.
+        h_d = hidden_state.detach()
+        q_d = query.detach()
+
+        index_query_kl = self.weight_iuq(q_d)
+        index_query_kl = index_query_kl.unflatten(-1, (self.index_num, self.index_head_dim))
+        k_pos = torch.arange(start_pos, start_pos + seq_len, device=index_query_kl.device)
+        index_query_kl = torch.cat(
+            [index_query_kl[..., :-rd], self.rope(index_query_kl[..., -rd:], k_pos)],
+            dim=-1,
+        )
+        w_kl = self.weight_h(h_d) * self.attention_scale
+        # Use Compressor's return value (from Phase 1) instead of kv_cache buffer
+        # to avoid buffer version-counter conflicts across steps.
+        index_score_kl = torch.einsum(
+            "bsnd,bld->bsnl", index_query_kl,
+            kv_compress if start_pos == 0 else self.kv_cache[:batch, : end_pos // m]
+        )
+        index_score_kl = (index_score_kl.relu() * w_kl.unsqueeze(-1)).sum(dim=-2)
+
+        if start_pos == 0:
+            _left = torch.arange(seq_len // m, device=index_score_kl.device).repeat(seq_len, 1)
+            _right = (
+                torch.arange(1, seq_len + 1, device=index_score_kl.device).unsqueeze(1) // m
+            )
+            index_score_kl = index_score_kl + torch.where(_left >= _right, float("-inf"), 0)
+
+        return topk_idxs, local_topk_idxs, index_score_kl
 
 
 class Attention(nn.Module):
@@ -1034,7 +1044,7 @@ class Attention(nn.Module):
             # 先写滑动窗口的，放到前win个
             if seq_len <= win:
                 # 直接存
-                self.kv_cache[:batch, :seq_len] = kv
+                self.kv_cache[:batch, :seq_len] = kv.detach()
             else:
                 # 在decode时按照 start_pos % win 保存的话
                 # 相当于前win个写满后，要接着回到一开始，覆盖旧的数据
@@ -1042,9 +1052,9 @@ class Attention(nn.Module):
                 # 那么最后5个token (7, 8, 9, 10, 11) 写到kv_cache的顺序是
                 # (10, 11, 7, 8, 9)
                 cutoff = seq_len % win
-                self.kv_cache[:batch, cutoff:win], self.kv_cache[:batch, :cutoff] = kv[
-                    :, -win:
-                ].split([win - cutoff, cutoff], dim=1)
+                self.kv_cache[:batch, cutoff:win], self.kv_cache[:batch, :cutoff] = [
+                    x.detach() for x in kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                ]
 
             # 之后是压缩部分的
             if m:
@@ -1058,7 +1068,7 @@ class Attention(nn.Module):
             )  # (batch, seq_len, n_head, head_dim)
 
         else:
-            self.kv_cache[:batch, start_pos % win] = kv.squeeze(1)
+            self.kv_cache[:batch, start_pos % win] = kv.detach().squeeze(1)
             if m:
                 self.compressor(x, start_pos)
 

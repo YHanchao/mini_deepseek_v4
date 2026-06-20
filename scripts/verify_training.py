@@ -143,13 +143,8 @@ def verify_training():
 
         total_loss = ntp_loss + 0.3 * mtp_loss + 0.5 * kl_loss
 
-        # Two backward phases (Eq. 3-4: "separate optimization"):
-        # Indexer detaches its inputs, so LM loss and KL loss see disjoint
-        # subgraphs. Whichever goes first needs retain_graph to keep the
-        # other's subgraph alive.
         model.zero_grad()
-        (0.5 * kl_loss).backward(retain_graph=True)
-        (ntp_loss + 0.3 * mtp_loss).backward()
+        total_loss.backward()
         grad_clip(model.parameters(), max_norm=1.0)
         muon_opt.step()
         adamw_opt.step()
