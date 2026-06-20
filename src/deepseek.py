@@ -971,6 +971,12 @@ class Attention(nn.Module):
         return output, weight_compress
 
     def forward(self, x: torch.Tensor, **kwargs):
+        # Clear previous step's indexer data to avoid holding stale
+        # autograd graph references across steps.
+        self._index_score = None
+        self._weight_compress = None
+        self._compress_topk_idxs = None
+
         start_pos = kwargs.get("start_pos", 0)
         batch, seq_len, _ = x.size()
         m = self.compress_ratio

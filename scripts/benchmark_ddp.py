@@ -91,12 +91,7 @@ def build_model_and_opt(args_dict, local_rank):
     adamw_opt = AdamW(adamw_p, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01)
     idx_opt = AdamW(idx_p, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01)
 
-    # Wrap with DDP. find_unused_parameters=True because Indexer params
-    # receive gradients from KL loss (separate backward) while main params
-    # receive gradients from LM loss — DDP sees them in different reduction
-    # phases with retain_graph between the two backward calls.
-    ddp_model = DDP(model, device_ids=[local_rank],
-                    find_unused_parameters=True)
+    ddp_model = DDP(model, device_ids=[local_rank])
 
     return ddp_model, muon_opt, adamw_opt, idx_opt, args
 
@@ -114,8 +109,8 @@ def train_step(ddp_model, args, muon_opt, adamw_opt, idx_opt,
                   for (iscore, wc, idx) in idx_data)
     lm_loss = ntp_loss + 0.3 * mtp_loss
 
-    (0.5 * kl_loss).backward(retain_graph=True)
-    lm_loss.backward()
+    total_loss = lm_loss + 0.5 * kl_loss
+    total_loss.backward()
 
     grad_clip(ddp_model.parameters(), max_norm=1.0)
     muon_opt.step()
