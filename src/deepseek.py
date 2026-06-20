@@ -678,7 +678,17 @@ class Indexer(nn.Module):
         原文中Eq. (13)输入hidden state生成compressed latent vector for query
         但这个向量c_t^Q是整个Attention共享的 (Shared KV MQA)
         所以这里要同时输入原始的x和Attention部分创建好的query c_t^Q
+
+        Returns:
+            (topk_idxs, index_score) — topk_idxs for sparse attention gather,
+            index_score (before topk) for KL auxiliary loss.
         """
+        # Detach inputs: Indexer is trained separately via KL loss.
+        # This detaches the Indexer subgraph from the main model,
+        # so LM loss backward and KL loss backward see disjoint graphs.
+        hidden_state = hidden_state.detach()
+        query = query.detach()
+
         batch, seq_len, _ = hidden_state.size()
         m = self.compress_ratio
         rd = self.rope_head_dim
@@ -701,7 +711,7 @@ class Indexer(nn.Module):
         positions = torch.arange(
             start_pos, start_pos + seq_len, device=index_query.device
         )
-        index_query[..., -rd:] = self.rope(index_query[..., -rd:], positions)
+        index_query = torch.cat([index_query[..., :-rd], self.rope(index_query[..., -rd:], positions)], dim=-1)
 
         # Eq.15
         # Eq15~16这里类似于做了一个小的attention
@@ -715,7 +725,7 @@ class Indexer(nn.Module):
         )
 
         # I: (batch, seq, block_num)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=-2)
+        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=-2)
 
         if start_pos == 0:
             # Eq.17: 训练and prefill 选topk时不能选未来的，因果掩码
@@ -735,23 +745,25 @@ class Indexer(nn.Module):
             )
 
             mask = _left >= _right
-            index_score += torch.where(mask, float("-inf"), 0)
+            index_score = index_score + torch.where(mask, float("-inf"), 0)
 
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // m), dim=-1)[1]
+        # Detach before topk: topk_idxs are only used as gather indices
+        # in sparse attention, no gradient flows through this path.
+        topk_idxs = index_score.detach().topk(min(self.index_topk, end_pos // m), dim=-1)[1]
 
         if start_pos == 0:
-            # 在序列一开始时，上一层会全都fill为-inf
-            # 那么返回的topk是没有意义的
-            # 所以进一步筛选，保证topk_idx取值合理
             mask = (
                 topk_idxs
                 >= torch.arange(1, seq_len + 1, device=index_score.device).unsqueeze(1)
                 // m
             )
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+            local_topk_idxs = topk_idxs.clone()
+            topk_idxs = torch.where(mask, -1, local_topk_idxs + offset)
+            local_topk_idxs = torch.where(mask, -1, local_topk_idxs)
         else:
+            local_topk_idxs = topk_idxs.clone()
             topk_idxs += offset
-        return topk_idxs
+        return topk_idxs, local_topk_idxs, index_score
 
 
 class Attention(nn.Module):
@@ -931,6 +943,7 @@ class Attention(nn.Module):
         topk_idxs: torch.Tensor,
         attn_sink: torch.Tensor,
         softmax_scale: float,
+        num_compress: int = 0,
     ) -> torch.Tensor:
         """
         PyTorch version 的 sparse attention 实现
@@ -941,9 +954,11 @@ class Attention(nn.Module):
         - kv: shared kv (batch, len // m, head_dim)
         - topk_idxs: (batch, len, topk)
         - attn_sink: addtitional bias for each head, (h,)
+        - num_compress: number of compressed-block entries at the end of topk_idxs
 
-        Output:
+        Returns:
         - o: (batch, len, n_head, head_dim)
+        - weight_compress: (batch, len, n_head, num_compress) or None if num_compress==0
         """
         b, m, h, d = q.shape
         topk = topk_idxs.shape[-1]
@@ -969,7 +984,13 @@ class Attention(nn.Module):
         weight = torch.softmax(score, dim=-1)[..., :topk]
 
         output = torch.einsum("bmhk,bmkd->bmhd", weight, v)
-        return output
+
+        if num_compress > 0:
+            # detach: KL loss trains indexer, not main model
+            weight_compress = weight[:, :, :, -num_compress:].detach()
+        else:
+            weight_compress = None
+        return output, weight_compress
 
     def forward(self, x: torch.Tensor, **kwargs):
         start_pos = kwargs.get("start_pos", 0)
@@ -987,15 +1008,15 @@ class Attention(nn.Module):
         q = self.w_uq(qr).unflatten(-1, (self.n_heads, self.head_dim))  # Eq.18
 
         # 归一化
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
 
         # RoPE for query
         positions = torch.arange(start_pos, start_pos + seq_len, device=q.device)
-        q[..., -rd:] = self.rope(q[..., -rd:], positions)
+        q = torch.cat([q[..., :-rd], self.rope(q[..., -rd:], positions)], dim=-1)
 
         # kv
         kv = self.rms_norm_kv(self.weight_kv(x))
-        kv[..., -rd:] = self.rope(kv[..., -rd:], positions)
+        kv = torch.cat([kv[..., :-rd], self.rope(kv[..., -rd:], positions)], dim=-1)
 
         # select topk indices
         topk_win = self._get_window_topk_id(batch, seq_len, start_pos)
@@ -1003,13 +1024,21 @@ class Attention(nn.Module):
         offset = seq_len if start_pos == 0 else self.window_size
 
         if m == 4:
-            compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+            compress_topk_idxs, local_topk_idxs, index_score = self.indexer(x, qr, start_pos, offset)
+            self._index_score = index_score
+            self._compress_topk_idxs = local_topk_idxs  # raw block indices for KL loss gather
         elif m > 0:
             compress_topk_idxs = self._get_compress_topk_id(
                 batch, seq_len, start_pos, offset
             ).to(kv.device)
+            self._index_score = None
+            self._compress_topk_idxs = None
         else:
             compress_topk_idxs = None
+            self._index_score = None
+            self._compress_topk_idxs = None
+
+        num_compress = compress_topk_idxs.shape[-1] if compress_topk_idxs is not None else 0
 
         if compress_topk_idxs is not None:
             topk_idxs = torch.cat([topk_win, compress_topk_idxs], dim=-1)
@@ -1040,8 +1069,8 @@ class Attention(nn.Module):
                     kv = torch.cat([kv, kv_compress], dim=1)
 
             # Sparse Attention
-            o = self._sparse_attention(
-                q, kv, topk_idxs, self.attn_sink, self.softmax_scale
+            o, weight_compress = self._sparse_attention(
+                q, kv, topk_idxs, self.attn_sink, self.softmax_scale, num_compress
             )  # (batch, seq_len, n_head, head_dim)
 
         else:
@@ -1050,11 +1079,14 @@ class Attention(nn.Module):
                 self.compressor(x, start_pos)
 
             # Sparse Attention
-            o = self._sparse_attention(
-                q, self.kv_cache[:batch], topk_idxs, self.attn_sink, self.softmax_scale
+            o, weight_compress = self._sparse_attention(
+                q, self.kv_cache[:batch], topk_idxs, self.attn_sink, self.softmax_scale, num_compress
             )  # (batch, seq_len, n_head, head_dim)
 
-        o[..., -rd:] = self.rope(o[..., -rd:], positions, inverse=True)
+        self._weight_compress = weight_compress
+
+        o_rope = self.rope(o[..., -rd:], positions, inverse=True)
+        o = torch.cat([o[..., :-rd], o_rope], dim=-1)
         # Grouped Ouput Projection
         o = o.view(batch, seq_len, self.output_group, -1)
         w_o_down = self.o_down.weight.view(self.output_group, self.output_lora, -1)
@@ -1078,14 +1110,23 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[tuple]]:
         """
         Input:
         - x: torch.Tensor of shape (batch, seq, hc_num, d_model)
+
+        Returns:
+        - x: torch.Tensor of shape (batch, seq, hc_num, d_model)
+        - indexer_data: (index_score, weight_compress, compress_topk_idxs) or None
         """
         x = self.attn_hc(x, start_pos=start_pos)
+        indexer_data = (
+            self.attention._index_score,
+            self.attention._weight_compress,
+            self.attention._compress_topk_idxs,
+        )
         x = self.ffn_hc(x, token_ids=input_ids)
-        return x
+        return x, indexer_data
 
 
 class PredictionHead(nn.Module):
@@ -1165,11 +1206,11 @@ class MTPBlock(TransformerBlock):
         x = self.x_norm(x)
 
         x = self.embed_proj(embedding).unsqueeze(2) + self.x_proj(x)
-        x = super().forward(x, start_pos, token_ids)
+        x, indexer_data = super().forward(x, start_pos, token_ids)
 
         logits = self.prediction_head(x)
 
-        return logits, x
+        return logits, x, indexer_data
 
 
 class DeepSeekV4(nn.Module):
@@ -1220,8 +1261,10 @@ class DeepSeekV4(nn.Module):
         embed = self.embedding(token_ids)  # (b, s, d)
         h = embed.unsqueeze(2).repeat(1, 1, self.hc_num, 1)  # (b, s, h, d)
 
+        indexer_data_list = []
         for layer in self.layers:
-            h = layer(h, start_pos, token_ids)
+            h, idx_data = layer(h, start_pos, token_ids)
+            indexer_data_list.append(idx_data)
 
         # Next token prediction
         ntp = self.prediction(h)
@@ -1229,10 +1272,11 @@ class DeepSeekV4(nn.Module):
         # Multi token prediction
         mtp_res = []
         for layer in self.mtp_layers:
-            mtp, h = layer(h, start_pos, token_ids)
+            mtp, h, idx_data = layer(h, start_pos, token_ids)
             mtp_res.append(mtp)
+            indexer_data_list.append(idx_data)
 
-        return ntp, mtp_res
+        return ntp, mtp_res, indexer_data_list
 
 
 if __name__ == "__main__":
@@ -1243,14 +1287,14 @@ if __name__ == "__main__":
     x = torch.randint(0, args.vocab_size, (2, 128))
     dpsk = DeepSeekV4(args)
 
-    ntp, mtp_list = dpsk(x)
+    ntp, mtp_list, _ = dpsk(x)
     print("prefill ntp:", ntp.size(), "mtp:", [m.size() for m in mtp_list])
     for i in range(128, 131):
-        ntp, mtp_list = dpsk(x[:, 0:1], i)
+        ntp, mtp_list, _ = dpsk(x[:, 0:1], i)
         print(f"decode pos {i}: ntp {ntp.size()}, mtp {[m.size() for m in mtp_list]}")
 
     h = torch.randn(2, 128, args.expansion_rate, args.d_model)
-    logits, _ = dpsk.mtp_layers[0](h, 0, x)
+    logits, _, _ = dpsk.mtp_layers[0](h, 0, x)
     print("mtp prefill:", logits.size())
-    logits, _ = dpsk.mtp_layers[0](h[:, 0:1], 1, x[:, 0:1])
+    logits, _, _ = dpsk.mtp_layers[0](h[:, 0:1], 1, x[:, 0:1])
     print("mtp decode:", logits.size())

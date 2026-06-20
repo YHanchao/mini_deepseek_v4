@@ -9,6 +9,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.tokenizer import BPETokenizer  # noqa: E402
 
+SPECIAL_TOKENS = [
+    "<|endoftext|>",
+    "<|beginoftext|>" "<|pad|>",
+    "<|user|>",
+    "<|assistant|>",
+    "<|system|>",
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "</tool_call>",
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description="训练 BPE tokenizer")
@@ -20,12 +32,6 @@ def main():
         help="目标词表大小（含 special tokens）",
     )
     parser.add_argument("--output-dir", required=True, help="保存 tokenizer 的目录")
-    parser.add_argument(
-        "--special-tokens",
-        nargs="*",
-        default=["<|endoftext|>"],
-        help="Special token 列表，空格分隔",
-    )
     parser.add_argument(
         "--max-chunk-size",
         type=int,
@@ -42,7 +48,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    tokenizer = BPETokenizer(vocab={}, merges=[], special_tokens=args.special_tokens)
+    tokenizer = BPETokenizer(vocab={}, merges=[], special_tokens=SPECIAL_TOKENS)
     vocab, merges = tokenizer.train(
         args.input,
         vocab_size=args.vocab_size,

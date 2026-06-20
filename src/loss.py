@@ -33,3 +33,46 @@ def cross_entropy_chunked(y_true, y_pred, chunk_size=8192):
         total_loss += nll.sum()
 
     return total_loss / y_true_flat.numel()
+
+
+def indexer_kl_loss(index_score, compress_topk_idxs, weight_compress):
+    """KL divergence loss for training the lightning indexer.
+
+    Eq. (3)-(4): L^I = Σ_t KL(p_{t,S_t} || Softmax(I_{t,S_t}))
+
+    Target distribution p is derived from main attention weights (detached).
+    Predicted distribution is softmax of indexer scores gathered at selected blocks.
+
+    Args:
+        index_score: (b, s, n_blocks) — indexer scores after causal masking, before topk
+        compress_topk_idxs: (b, s, topk) — indices of selected compressed blocks
+        weight_compress: (b, s, n_heads, topk) — attention weights for compressed blocks (detached)
+
+    Returns:
+        scalar KL loss, or 0.0 if no indexer data is available
+    """
+    if index_score is None or compress_topk_idxs is None or weight_compress is None:
+        return torch.tensor(0.0, device=weight_compress.device if weight_compress is not None else (
+            index_score.device if index_score is not None else None))
+
+    b, s, n_heads, topk = weight_compress.shape
+
+    # Target: sum attention weights across heads, L1 normalize → p_{t,S_t}
+    target = weight_compress.sum(dim=2)  # (b, s, topk)
+    target = target / (target.sum(dim=-1, keepdim=True) + 1e-8)
+
+    # Predicted: gather index_score at selected indices, softmax
+    mask = compress_topk_idxs == -1
+    idx = compress_topk_idxs.clamp(0)
+    pred = index_score.gather(-1, idx)  # (b, s, topk)
+    pred = pred.masked_fill(mask, float("-inf"))
+
+    # KL(target || softmax(pred))
+    log_pred = torch.log_softmax(pred, dim=-1)  # (b, s, topk)
+    kl = target * (torch.log(target + 1e-8) - log_pred)  # (b, s, topk)
+    kl = kl.masked_fill(mask | torch.isnan(kl), 0.0)
+    kl = kl.sum(dim=-1)  # (b, s)
+
+    # Only count positions that attend to at least one compressed block
+    valid = target.sum(dim=-1) > 1e-8  # (b, s)
+    return kl[valid].mean() if valid.any() else torch.tensor(0.0)

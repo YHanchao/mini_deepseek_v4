@@ -70,6 +70,70 @@ class AdamW(optim.Optimizer):
         return loss
 
 
+class Muon(optim.Optimizer):
+    def __init__(
+        self, params, lr=1e-3, momentum=0.95, weight_decay=0.1, update_rescale=0.18
+    ):
+        defaults = {
+            "lr": lr,
+            "momentum": momentum,
+            "weight_decay": weight_decay,
+            "update_rescale": update_rescale,
+        }
+        self.abc_list = [(3.4445, -4.7750, 2.0315)] * 8 + [(2, -1.5, 0.5)] * 2
+        super().__init__(params, defaults)
+
+    def hybrid_newton_schulz(
+        self, X: torch.Tensor, abc_list: list[tuple[float]], eps=1e-20
+    ):
+        # Step 1: normalize matrix M as M_0 = M / \Vert M\Vert_F
+        assert X.ndim >= 2
+        y, dtype, need_transpose = X.bfloat16(), X.dtype, X.shape[-2] > X.shape[-1]
+        # Recall: 矩阵计算的FLOPs (m, n), (n, m) -> m^2n
+        # 所以最好n大m小
+        y = y.mT if need_transpose else y
+        y /= ((y**2).sum(axis=(-2, -1), keepdims=True) + eps) ** 0.5
+
+        for _, abc in enumerate(abc_list):
+            a, b, c = abc
+            # Follow the implementation of KellerJordan
+            A = y @ y.mT
+            B = b * A + c * A @ A
+            y = a * y + B @ y
+
+        y = y.mT if need_transpose else y
+        return y.to(dtype)
+
+    def step(self, closure=None):
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            weight_decay = group["weight_decay"]
+            update_rescale = group["update_rescale"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+
+                _n, _m = p.shape[-2], p.shape[-1]
+
+                if "m" not in state:
+                    state["m"] = torch.zeros_like(p)
+
+                state["m"].data = state["m"].data * momentum + p.grad.data
+                O = self.hybrid_newton_schulz(
+                    state["m"].data * momentum + p.grad.data, self.abc_list
+                )
+                O *= max(_n, _m) * update_rescale
+                p.data *= 1 - lr * weight_decay
+                p.data -= lr * O
+
+        return loss
+
+
 def cosine_annealing_lr_schedule(t, lr_max, lr_min, warm_iter, anneal_iter):
     if t < warm_iter:
         # Warm-up stage
@@ -91,3 +155,39 @@ def grad_clip(params: Iterable[torch.nn.Parameter], max_norm, eps=1e-6):
         for p in params:
             if p.grad is not None:
                 p.grad.data *= scale
+
+
+def group_params(model):
+    """Split model parameters into Muon (matrix) and AdamW (vector/special) groups.
+
+    Indexer params are excluded — they are trained separately via KL loss.
+
+    Layer 1 (hard constraint): params with ndim < 2 → AdamW
+    Layer 2 (paper exceptions): ≥2D but specified as AdamW by name keywords
+    Layer 3 (remainder): all other ≥2D params → Muon
+    """
+    muon_p, adamw_p = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "indexer" in name:
+            continue  # trained separately via KL loss
+        if p.ndim < 2:
+            adamw_p.append(p)
+        elif any(
+            kw in name
+            for kw in ["embedding", "prediction", "phi_pre", "phi_post", "phi_res"]
+        ):
+            adamw_p.append(p)
+        else:
+            muon_p.append(p)
+    return muon_p, adamw_p
+
+
+def get_indexer_params(model):
+    """Return list of all Indexer parameters (trained via KL loss)."""
+    return [
+        p
+        for name, p in model.named_parameters()
+        if p.requires_grad and "indexer" in name
+    ]
