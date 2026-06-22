@@ -155,6 +155,7 @@ def grad_clip(params: Iterable[torch.nn.Parameter], max_norm, eps=1e-6):
         for p in params:
             if p.grad is not None:
                 p.grad.data *= scale
+    return total_norm.item()
 
 
 def group_params(model):

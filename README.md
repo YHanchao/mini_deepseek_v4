@@ -13,8 +13,8 @@
 | Loss (CE + Indexer KL) | ✅ 完成 | 无 |
 | Benchmark | ✅ 完成 | DGX Spark + 4×4090 DDP 实测 |
 | 数据预处理 | ✅ 完成 | 3,353,583,956 tokens |
-| 训练脚本 | 🔜 进行中 | DDP 训练入口 |
-| 正式预训练 | ⏳ 待开始 | 预计 ~6.3 天，6.7B tokens |
+| 训练脚本 | ✅ 完成 | 无 |
+| 正式预训练 | ⏳ 进行中 | 别让等待，成为遗憾... |
 
 ## 架构
 
@@ -56,12 +56,10 @@ scripts/      # 实验脚本
   pre_tokenization.py/sh  — 数据预处理
   train_tokenizer.py/sh   — Tokenizer 训练
   benchmark.py/ddp.py     — 吞吐基准测试
-  verify_training.py      — 全流程验证
+  verify_training.py      — 随机数据前向/反向代码验证
 docs/         # 文档
   training_plan.md         — 训练计划与执行细节
   benchmark_results.md     — Benchmark 实测数据
-  csa_compressor.md        — CSA Compressor 分析
-  memory_optimization_analysis.md — 显存优化分析
 config.py     # 模型配置定义
 ```
 

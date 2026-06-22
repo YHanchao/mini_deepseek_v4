@@ -85,10 +85,6 @@ torchrun --nproc_per_node=4 scripts/train.py \
 > effective batch = 4 GPUs × 4 batch × 1024 seq = 16,384 tokens/step
 > 500K steps × 16,384 = 8.2B tokens → ~6.3 天
 
-### 阶段 2（可选）：换 OWT 数据再训
-
-TinyStories 偏简单（儿童故事），如果想看模型在更丰富数据上的表现，预处理 OWT 后替换数据路径即可。3B tokens（~2 天）就能看到明显差异。
-
 ## TODO 列表
 
 - [x] DeepSeekV4 模型代码
@@ -101,17 +97,7 @@ TinyStories 偏简单（儿童故事），如果想看模型在更丰富数据�
 - [x] `.detach()` fix（Compressor buffer 写入需 detach，PyTorch 2.12 要求）
 - [x] **TODO-1**: 修复 Muon Nesterov（对 `momentum * state["m"] + p.grad` 做 NS）
 - [x] **TODO-2**: `scripts/verify_training.py` — 随机数据 150 步全流程验证
-- [ ] **TODO-3**: `src/dataset.py` + `scripts/preprocess_data.py` — 数据预处理管线
-- [ ] **TODO-4**: `scripts/train.py` — 正式训练脚本，支持 `--distributed` 开关
-- [ ] **TODO-5**: DGX Spark 上用 tiny 冒烟验证（阶段 0）
+- [x] **TODO-3**: `src/dataset.py` + `scripts/preprocess_data.py` — 数据预处理管线
+- [x] **TODO-4**: `scripts/train.py` — 正式训练脚本，支持 `--distributed` 开关
+- [x] **TODO-5**: DGX Spark 上用 tiny 冒烟验证（阶段 0）
 - [ ] **TODO-6**: 4×4090 上用 small 正式训练（阶段 1）
-
-## 文件总览
-
-| 文件 | 操作 | 所属 TODO |
-|------|------|----------|
-| src/optimizer.py | 修复 Muon Nesterov | TODO-1 |
-| scripts/verify_training.py | **新建** | TODO-2 |
-| src/dataset.py | **新建** | TODO-3 |
-| scripts/preprocess_data.py | **新建** | TODO-3 |
-| scripts/train.py | **新建** | TODO-4 |
