@@ -125,23 +125,22 @@ class Trainer:
     # -------------------
     # ckpt 相关
     def save_checkpoint(self, path: str, step: int, extra: Optional[Dict] = None):
-        if not self.is_main:
-            return
-        model = self.model.module if isinstance(self.model, DDP) else self.model
-        ckpt = {
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizers_state_dict": [opt.state_dict() for opt in self.optimizers],
-            "best_val_loss": self.best_val_loss,
-            "torch_rng_state": torch.get_rng_state().cpu().clone(),
-            "cuda_rng_state": (
-                torch.cuda.get_rng_state().cpu().clone()
-                if torch.cuda.is_available()
-                else None
-            ),
-            "extra": extra or {},
-        }
-        torch.save(ckpt, path)
+        if self.is_main:
+            model = self.model.module if isinstance(self.model, DDP) else self.model
+            ckpt = {
+                "step": step,
+                "model_state_dict": model.state_dict(),
+                "optimizers_state_dict": [opt.state_dict() for opt in self.optimizers],
+                "best_val_loss": self.best_val_loss,
+                "torch_rng_state": torch.get_rng_state().cpu().clone(),
+                "cuda_rng_state": (
+                    torch.cuda.get_rng_state().cpu().clone()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                "extra": extra or {},
+            }
+            torch.save(ckpt, path)
 
         if self.world_size > 1:
             dist.barrier()
@@ -215,8 +214,6 @@ class Trainer:
         )
 
         if self.wandb_run:
-            import wandb
-
             self.wandb_run.log(
                 {
                     "train/lm_loss": losses.get("lm", 0),

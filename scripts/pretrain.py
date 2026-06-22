@@ -10,7 +10,12 @@ Usage:
         --data-val /mnt/nfs/data/valid.bin
 """
 
+import os
+import sys
 import argparse
+
+# 确保项目根目录在 Python 路径中，torchrun 不会自动加
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.trainer import PretrainTrainer, PretrainTrainerArgs
 
@@ -19,7 +24,7 @@ def get_args():
     p = argparse.ArgumentParser(description="Pretrain DeepSeekV4 mini")
 
     # 从命令行覆盖的关键字段（其他字段用 PretrainTrainerArgs 默认值）
-    p.add_argument("--config", type=str, default="small")
+    p.add_argument("--config-name", type=str, default="small")
     p.add_argument("--data-train", type=str, default="data/train.bin")
     p.add_argument("--data-val", type=str, default="data/valid.bin")
     p.add_argument("--batch-size", type=int, default=4)
