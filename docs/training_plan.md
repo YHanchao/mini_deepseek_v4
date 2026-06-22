@@ -99,8 +99,8 @@ TinyStories 偏简单（儿童故事），如果想看模型在更丰富数据�
 - [x] `group_params` / `get_indexer_params`
 - [x] Benchmark 脚本 + 实测数据
 - [x] `.detach()` fix（Compressor buffer 写入需 detach，PyTorch 2.12 要求）
-- [ ] **TODO-1**: 修复 Muon Nesterov（对 `momentum * state["m"] + p.grad` 做 NS）
-- [ ] **TODO-2**: `scripts/verify_training.py` — 随机数据 150 步全流程验证
+- [x] **TODO-1**: 修复 Muon Nesterov（对 `momentum * state["m"] + p.grad` 做 NS）
+- [x] **TODO-2**: `scripts/verify_training.py` — 随机数据 150 步全流程验证
 - [ ] **TODO-3**: `src/dataset.py` + `scripts/preprocess_data.py` — 数据预处理管线
 - [ ] **TODO-4**: `scripts/train.py` — 正式训练脚本，支持 `--distributed` 开关
 - [ ] **TODO-5**: DGX Spark 上用 tiny 冒烟验证（阶段 0）

@@ -8,18 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.tokenizer import BPETokenizer  # noqa: E402
-
-SPECIAL_TOKENS = [
-    "<|endoftext|>",
-    "<|beginoftext|>" "<|pad|>",
-    "<|user|>",
-    "<|assistant|>",
-    "<|system|>",
-    "<think>",
-    "</think>",
-    "<tool_call>",
-    "</tool_call>",
-]
+import config
 
 
 def main():
@@ -48,7 +37,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    tokenizer = BPETokenizer(vocab={}, merges=[], special_tokens=SPECIAL_TOKENS)
+    tokenizer = BPETokenizer(vocab={}, merges=[], special_tokens=config.SPECIAL_TOKENS)
     vocab, merges = tokenizer.train(
         args.input,
         vocab_size=args.vocab_size,
