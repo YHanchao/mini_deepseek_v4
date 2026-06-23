@@ -165,7 +165,7 @@ class Trainer:
     def _cleanup_checkpoints(self):
         if not self.is_main:
             return
-        ckpts = sorted(Path(self.output_dir).glob("ckpt_*.pt"))
+        ckpts = sorted(Path(self.output_dir).glob("ckpt_[0-9]*.pt"))
         for old in ckpts[: -self.keep_last_ckpt]:
             old.unlink(missing_ok=True)
 
