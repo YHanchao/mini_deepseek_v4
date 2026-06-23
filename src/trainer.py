@@ -413,7 +413,6 @@ class PretrainTrainer(Trainer):
 
     def __init__(self, args: PretrainTrainerArgs):
         super().__init__(args)
-        self.idx_p: list = []
         self._model_args: Optional[DSArgs] = None
 
     def build_model_and_optimizers(self):
@@ -438,7 +437,6 @@ class PretrainTrainer(Trainer):
 
         muon_p, adamw_p = group_params(model)
         idx_p = get_indexer_params(model)
-        self.idx_p = idx_p
 
         muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
         adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
@@ -448,7 +446,7 @@ class PretrainTrainer(Trainer):
 
         if self.world_size > 1:
             self.model = DDP(
-                model, device_ids=[self.local_rank]
+                model, device_ids=[self.local_rank], find_unused_parameters=False
             )
         else:
             self.model = model
@@ -546,29 +544,18 @@ class PretrainTrainer(Trainer):
             for i, m in enumerate(mtp_list)
         )
         kl_loss = sum(
-            indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
+            indexer_kl_loss(iscore, idx, wc.detach() if wc is not None else None)
+            for (iscore, wc, idx) in idx_data
         )
 
         lm_loss = ntp_loss + 0.3 * mtp_loss
-        lm_loss_scaled = lm_loss / self.grad_accum
-        kl_loss_scaled = 0.5 * kl_loss / self.grad_accum
+        total_loss = (lm_loss + 0.5 * kl_loss) / self.grad_accum
 
-        # KL grad: manual, bypasses DDP hooks
-        idx_p = self.idx_p
-        if idx_p and kl_loss_scaled.requires_grad:
-            idx_grads = torch.autograd.grad(
-                kl_loss_scaled, idx_p, retain_graph=True, allow_unused=True
-            )
-            for p, g in zip(idx_p, idx_grads):
-                if g is not None:
-                    p.grad = g if p.grad is None else p.grad.add_(g)
-
-        # LM backward — no_sync for non-last micro-batches in DDP
         if self.world_size > 1 and not is_last_micro:
             with self.model.no_sync():
-                lm_loss_scaled.backward()
+                total_loss.backward()
         else:
-            lm_loss_scaled.backward()
+            total_loss.backward()
 
         return {
             "ntp": ntp_loss.item(),
