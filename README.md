@@ -98,4 +98,9 @@ python scripts/verify_training.py --config small
 
 # Benchmark 单卡吞吐
 python scripts/benchmark.py --config small
+
+# 预训练
+torchrun --nproc_per_node=4 scripts/pretrain.py \
+    --data-train /data/train.bin \
+    --data-val  /data/valid.bin
 ```

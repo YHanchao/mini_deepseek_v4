@@ -332,11 +332,23 @@ class Trainer:
             for k in accum_losses:
                 accum_losses[k] /= self.grad_accum
 
-            lm = accum_losses.get("lm", 0.0)
-            if not torch.isfinite(torch.tensor(lm)):
-                self._log(
-                    f"Step {step}: NaN/Inf loss detected! Saving emergency checkpoint."
+            if not all(
+                torch.isfinite(torch.tensor(v)) for v in accum_losses.values()
+            ):
+                details = " ".join(
+                    f"{k}={v:.4f}" for k, v in accum_losses.items()
                 )
+                self._log(f"Step {step}: NaN/Inf — losses: {details}")
+
+                nan_params = []
+                for name, p in self.model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        nan_params.append(name)
+                if nan_params:
+                    self._log(f"  Grad NaN in: {nan_params[:10]}...")
+                else:
+                    self._log(f"  Grads clean — NaN from forward/loss")
+
                 self.save_checkpoint(
                     os.path.join(self.output_dir, f"ckpt_nan_{step:07d}.pt"),
                     step,
