@@ -1,3 +1,4 @@
+import gc
 import os
 import time
 import datetime
@@ -348,6 +349,12 @@ class Trainer:
 
             grad_norm = self._optimizer_step()
 
+            # 定期触发 GC 回收 autograd 图循环引用
+            if step % 100 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             step_time = time.time() - self._step_start_time
 
             if step % self.log_every == 0:
@@ -441,7 +448,7 @@ class PretrainTrainer(Trainer):
 
         if self.world_size > 1:
             self.model = DDP(
-                model, device_ids=[self.local_rank], find_unused_parameters=True
+                model, device_ids=[self.local_rank]
             )
         else:
             self.model = model
