@@ -446,7 +446,7 @@ class PretrainTrainer(Trainer):
 
         if self.world_size > 1:
             self.model = DDP(
-                model, device_ids=[self.local_rank], find_unused_parameters=False
+                model, device_ids=[self.local_rank], find_unused_parameters=True
             )
         else:
             self.model = model
