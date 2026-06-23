@@ -94,7 +94,7 @@ class Gate(nn.Module):
 
     def forward(self, x: torch.Tensor):
         scores = self.route(x.float())
-        scores = torch.sqrt(F.softplus(scores))
+        scores = torch.sqrt(F.softplus(scores) + 1e-8)
         original_scores = scores
 
         # bias 仅用于 expert 选择，不影响权重

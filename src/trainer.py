@@ -339,16 +339,6 @@ class Trainer:
                     f"{k}={v:.4f}" for k, v in accum_losses.items()
                 )
                 self._log(f"Step {step}: NaN/Inf — losses: {details}")
-
-                nan_params = []
-                for name, p in self.model.named_parameters():
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        nan_params.append(name)
-                if nan_params:
-                    self._log(f"  Grad NaN in: {nan_params[:10]}...")
-                else:
-                    self._log(f"  Grads clean — NaN from forward/loss")
-
                 self.save_checkpoint(
                     os.path.join(self.output_dir, f"ckpt_nan_{step:07d}.pt"),
                     step,
@@ -440,10 +430,9 @@ class PretrainTrainer(Trainer):
         model = model.to(self.local_rank)
 
         muon_p, adamw_p = group_params(model)
-        idx_p = get_indexer_params(model)  # 偷懒了，理应这里也分Muon & Adam的
+        idx_p = get_indexer_params(model)
         self.idx_p = idx_p
 
-        # 直接 fix 为论文里面的优化器超参
         muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
         adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
         idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
