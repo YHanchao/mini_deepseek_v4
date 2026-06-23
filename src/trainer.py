@@ -545,7 +545,10 @@ class PretrainTrainer(Trainer):
         ntp, mtp_list, idx_data = self.model(input_ids)
 
         ntp_loss = cross_entropy(target_ids, ntp)
-        mtp_loss = sum(cross_entropy(target_ids, m) for m in mtp_list)
+        mtp_loss = sum(
+            cross_entropy(target_ids[:, i + 1 :], m[:, : -(i + 1)])
+            for i, m in enumerate(mtp_list)
+        )
         kl_loss = sum(
             indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
         )
@@ -605,7 +608,10 @@ class PretrainTrainer(Trainer):
             ntp, mtp_list, idx_data = self.model(input_ids)
 
             total_ntp += cross_entropy(target_ids, ntp).item()
-            total_mtp += sum(cross_entropy(target_ids, m).item() for m in mtp_list)
+            total_mtp += sum(
+                cross_entropy(target_ids[:, i + 1 :], m[:, : -(i + 1)]).item()
+                for i, m in enumerate(mtp_list)
+            )
             total_kl += sum(
                 indexer_kl_loss(iscore, idx, wc).item()
                 for (iscore, wc, idx) in idx_data

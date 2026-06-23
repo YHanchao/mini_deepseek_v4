@@ -133,7 +133,10 @@ def verify_training():
         ntp_logits, mtp_list, indexer_data_list = model(input_ids)
 
         ntp_loss = cross_entropy(input_ids[:, 1:], ntp_logits[:, :-1])
-        mtp_loss = sum(cross_entropy(input_ids[:, 1:], mtp[:, :-1]) for mtp in mtp_list)
+        mtp_loss = sum(
+            cross_entropy(input_ids[:, i + 2 :], mtp[:, : -(i + 2)])
+            for i, mtp in enumerate(mtp_list)
+        )
 
         # Indexer KL loss (Eq. 3-4): separate optimization
         kl_loss = sum(
