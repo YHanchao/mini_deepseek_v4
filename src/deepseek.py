@@ -511,17 +511,21 @@ class Compressor(nn.Module):
                 # ---- overlap path (ratio == 4) ----
                 if cut_off >= ratio:
                     # 存下最后一个完整块，供decode时消耗
-                    self.kv_state[:batch, :ratio] = kv[:, cut_off - ratio : cut_off]
+                    self.kv_state[:batch, :ratio] = kv[
+                        :, cut_off - ratio : cut_off
+                    ].detach()
                     self.score_state[:batch, :ratio] = (
                         score[:, cut_off - ratio : cut_off] + self.bias
-                    )
+                    ).detach()
 
                 if remainder > 0:
-                    kv, self.kv_state[:batch, ratio : ratio + remainder] = kv.split(
-                        [cut_off, remainder], dim=1
+                    kv, state_chunk = kv.split([cut_off, remainder], dim=1)
+                    self.kv_state[:batch, ratio : ratio + remainder] = (
+                        state_chunk.detach()
                     )
+                    score_state_chunk = score[:, cut_off:] + self.bias[:remainder]
                     self.score_state[:batch, ratio : ratio + remainder] = (
-                        score[:, cut_off:] + self.bias[:remainder]
+                        score_state_chunk.detach()
                     )
                     score = score[:, :cut_off]
 
@@ -538,10 +542,10 @@ class Compressor(nn.Module):
             else:
                 # ---- non-overlap path (ratio == 128) ----
                 if remainder > 0:
-                    self.kv_state[:batch, :remainder] = kv[:, cut_off:]
+                    self.kv_state[:batch, :remainder] = kv[:, cut_off:].detach()
                     self.score_state[:batch, :remainder] = (
                         score[:, cut_off:] + self.bias[:remainder]
-                    )
+                    ).detach()
                     kv = kv[:, :cut_off]
                     score = score[:, :cut_off]
 
@@ -700,7 +704,9 @@ class Indexer(nn.Module):
         with torch.no_grad():
             # Eq.14
             index_query = self.weight_iuq(query)
-            index_query = index_query.unflatten(-1, (self.index_num, self.index_head_dim))
+            index_query = index_query.unflatten(
+                -1, (self.index_num, self.index_head_dim)
+            )
 
             # Apply RoPE
             positions = torch.arange(
@@ -714,27 +720,28 @@ class Indexer(nn.Module):
             # Eq.15-16: compute index_score for topk selection
             weights = self.weight_h(hidden_state) * self.attention_scale
             idx_score = torch.einsum(
-                "bsnd,bld->bsnl", index_query,
-                self.kv_cache[:batch, : end_pos // m]
+                "bsnd,bld->bsnl", index_query, self.kv_cache[:batch, : end_pos // m]
             )
             idx_score = (idx_score.relu() * weights.unsqueeze(-1)).sum(dim=-2)
 
             if start_pos == 0:
-                _left = torch.arange(seq_len // m, device=idx_score.device).repeat(seq_len, 1)
+                _left = torch.arange(seq_len // m, device=idx_score.device).repeat(
+                    seq_len, 1
+                )
                 _right = (
-                    torch.arange(1, seq_len + 1, device=idx_score.device).unsqueeze(1) // m
+                    torch.arange(1, seq_len + 1, device=idx_score.device).unsqueeze(1)
+                    // m
                 )
                 idx_score = idx_score + torch.where(_left >= _right, float("-inf"), 0)
 
-            topk_idxs = idx_score.topk(
-                min(self.index_topk, end_pos // m), dim=-1
-            )[1]
+            topk_idxs = idx_score.topk(min(self.index_topk, end_pos // m), dim=-1)[1]
 
         # Extract local_topk_idxs from no_grad results
         if start_pos == 0:
             causal_mask = (
                 topk_idxs
-                >= torch.arange(1, seq_len + 1, device=idx_score.device).unsqueeze(1) // m
+                >= torch.arange(1, seq_len + 1, device=idx_score.device).unsqueeze(1)
+                // m
             )
             local_topk_idxs = topk_idxs.clone()
             topk_idxs = torch.where(causal_mask, -1, local_topk_idxs + offset)
@@ -751,8 +758,12 @@ class Indexer(nn.Module):
         q_d = query.detach()
 
         index_query_kl = self.weight_iuq(q_d)
-        index_query_kl = index_query_kl.unflatten(-1, (self.index_num, self.index_head_dim))
-        k_pos = torch.arange(start_pos, start_pos + seq_len, device=index_query_kl.device)
+        index_query_kl = index_query_kl.unflatten(
+            -1, (self.index_num, self.index_head_dim)
+        )
+        k_pos = torch.arange(
+            start_pos, start_pos + seq_len, device=index_query_kl.device
+        )
         index_query_kl = torch.cat(
             [index_query_kl[..., :-rd], self.rope(index_query_kl[..., -rd:], k_pos)],
             dim=-1,
@@ -761,17 +772,23 @@ class Indexer(nn.Module):
         # Use Compressor's return value (from Phase 1) instead of kv_cache buffer
         # to avoid buffer version-counter conflicts across steps.
         index_score_kl = torch.einsum(
-            "bsnd,bld->bsnl", index_query_kl,
-            kv_compress if start_pos == 0 else self.kv_cache[:batch, : end_pos // m]
+            "bsnd,bld->bsnl",
+            index_query_kl,
+            kv_compress if start_pos == 0 else self.kv_cache[:batch, : end_pos // m],
         )
         index_score_kl = (index_score_kl.relu() * w_kl.unsqueeze(-1)).sum(dim=-2)
 
         if start_pos == 0:
-            _left = torch.arange(seq_len // m, device=index_score_kl.device).repeat(seq_len, 1)
-            _right = (
-                torch.arange(1, seq_len + 1, device=index_score_kl.device).unsqueeze(1) // m
+            _left = torch.arange(seq_len // m, device=index_score_kl.device).repeat(
+                seq_len, 1
             )
-            index_score_kl = index_score_kl + torch.where(_left >= _right, float("-inf"), 0)
+            _right = (
+                torch.arange(1, seq_len + 1, device=index_score_kl.device).unsqueeze(1)
+                // m
+            )
+            index_score_kl = index_score_kl + torch.where(
+                _left >= _right, float("-inf"), 0
+            )
 
         return topk_idxs, local_topk_idxs, index_score_kl
 
@@ -831,9 +848,7 @@ class Attention(nn.Module):
         )
 
         self.rope = rope
-        self.attn_sink = nn.Parameter(
-            torch.zeros(self.n_heads, device=args.device)
-        )
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, device=args.device))
 
         self.o_down = model.Linear(
             self.n_heads * self.head_dim // self.output_group,
@@ -919,7 +934,9 @@ class Attention(nn.Module):
             matrix = torch.arange(0, (start_pos + 1) // ratio, device=dev) + offset
         else:
             matrix = torch.arange(seq_len // ratio, device=dev).repeat(seq_len, 1)
-            mask = matrix >= torch.arange(1, seq_len + 1, device=dev).unsqueeze(1) // ratio
+            mask = (
+                matrix >= torch.arange(1, seq_len + 1, device=dev).unsqueeze(1) // ratio
+            )
             matrix = torch.where(mask, -1, matrix + offset)
 
         return matrix.unsqueeze(0).expand(batch, -1, -1)
@@ -1018,9 +1035,13 @@ class Attention(nn.Module):
         offset = seq_len if start_pos == 0 else self.window_size
 
         if m == 4:
-            compress_topk_idxs, local_topk_idxs, index_score = self.indexer(x, qr, start_pos, offset)
+            compress_topk_idxs, local_topk_idxs, index_score = self.indexer(
+                x, qr, start_pos, offset
+            )
             self._index_score = index_score
-            self._compress_topk_idxs = local_topk_idxs  # raw block indices for KL loss gather
+            self._compress_topk_idxs = (
+                local_topk_idxs  # raw block indices for KL loss gather
+            )
         elif m > 0:
             compress_topk_idxs = self._get_compress_topk_id(
                 batch, seq_len, start_pos, offset
@@ -1032,7 +1053,9 @@ class Attention(nn.Module):
             self._index_score = None
             self._compress_topk_idxs = None
 
-        num_compress = compress_topk_idxs.shape[-1] if compress_topk_idxs is not None else 0
+        num_compress = (
+            compress_topk_idxs.shape[-1] if compress_topk_idxs is not None else 0
+        )
 
         if compress_topk_idxs is not None:
             topk_idxs = torch.cat([topk_win, compress_topk_idxs], dim=-1)
@@ -1053,7 +1076,8 @@ class Attention(nn.Module):
                 # (10, 11, 7, 8, 9)
                 cutoff = seq_len % win
                 self.kv_cache[:batch, cutoff:win], self.kv_cache[:batch, :cutoff] = [
-                    x.detach() for x in kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                    x.detach()
+                    for x in kv[:, -win:].split([win - cutoff, cutoff], dim=1)
                 ]
 
             # 之后是压缩部分的
@@ -1074,7 +1098,12 @@ class Attention(nn.Module):
 
             # Sparse Attention
             o, weight_compress = self._sparse_attention(
-                q, self.kv_cache[:batch], topk_idxs, self.attn_sink, self.softmax_scale, num_compress
+                q,
+                self.kv_cache[:batch],
+                topk_idxs,
+                self.attn_sink,
+                self.softmax_scale,
+                num_compress,
             )  # (batch, seq_len, n_head, head_dim)
 
         self._weight_compress = weight_compress
