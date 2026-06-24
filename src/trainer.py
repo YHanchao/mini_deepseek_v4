@@ -350,9 +350,10 @@ class Trainer:
             grad_norm = self._optimizer_step()
 
             # 定期触发 GC 回收 autograd 图循环引用
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if step % 100 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             step_time = time.time() - self._step_start_time
 
@@ -412,7 +413,6 @@ class PretrainTrainer(Trainer):
 
     def __init__(self, args: PretrainTrainerArgs):
         super().__init__(args)
-        self.idx_p: list = []
         self._model_args: Optional[DSArgs] = None
 
     def build_model_and_optimizers(self):
@@ -437,7 +437,6 @@ class PretrainTrainer(Trainer):
 
         muon_p, adamw_p = group_params(model)
         idx_p = get_indexer_params(model)
-        self.idx_p = idx_p
 
         muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
         adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
@@ -447,7 +446,7 @@ class PretrainTrainer(Trainer):
 
         if self.world_size > 1:
             self.model = DDP(
-                model, device_ids=[self.local_rank], find_unused_parameters=False
+                model, device_ids=[self.local_rank], find_unused_parameters=True
             )
         else:
             self.model = model
@@ -551,12 +550,6 @@ class PretrainTrainer(Trainer):
 
         lm_loss = ntp_loss + 0.3 * mtp_loss
         total_loss = (lm_loss + 0.5 * kl_loss) / self.grad_accum
-
-        # Connect indexer params to the computation graph with
-        # zero coefficient so DDP find_unused_parameters=False
-        # sees them as "used" without affecting gradients.
-        for p in self.idx_p:
-            total_loss = total_loss + 0.0 * p.float().sum()
 
         if self.world_size > 1 and not is_last_micro:
             with self.model.no_sync():
