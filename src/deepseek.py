@@ -511,22 +511,19 @@ class Compressor(nn.Module):
                 # ---- overlap path (ratio == 4) ----
                 if cut_off >= ratio:
                     # 存下最后一个完整块，供decode时消耗
-                    self.kv_state[:batch, :ratio] = kv[
-                        :, cut_off - ratio : cut_off
-                    ].detach()
-                    self.score_state[:batch, :ratio] = (
-                        score[:, cut_off - ratio : cut_off] + self.bias
-                    ).detach()
+                    with torch.no_grad():
+                        self.kv_state[:batch, :ratio] = kv[:, cut_off - ratio : cut_off]
+                        self.score_state[:batch, :ratio] = (
+                            score[:, cut_off - ratio : cut_off] + self.bias
+                        )
 
                 if remainder > 0:
-                    kv, state_chunk = kv.split([cut_off, remainder], dim=1)
-                    self.kv_state[:batch, ratio : ratio + remainder] = (
-                        state_chunk.detach()
-                    )
-                    score_state_chunk = score[:, cut_off:] + self.bias[:remainder]
-                    self.score_state[:batch, ratio : ratio + remainder] = (
-                        score_state_chunk.detach()
-                    )
+                    kv, buf_chunk = kv.split([cut_off, remainder], dim=1)
+                    with torch.no_grad():
+                        self.kv_state[:batch, ratio : ratio + remainder] = buf_chunk
+                        self.score_state[:batch, ratio : ratio + remainder] = (
+                            score[:, cut_off:] + self.bias[:remainder]
+                        )
                     score = score[:, :cut_off]
 
                 # Step 2: implement Eq. (9)--(12)
@@ -542,10 +539,11 @@ class Compressor(nn.Module):
             else:
                 # ---- non-overlap path (ratio == 128) ----
                 if remainder > 0:
-                    self.kv_state[:batch, :remainder] = kv[:, cut_off:].detach()
-                    self.score_state[:batch, :remainder] = (
-                        score[:, cut_off:] + self.bias[:remainder]
-                    ).detach()
+                    with torch.no_grad():
+                        self.kv_state[:batch, :remainder] = kv[:, cut_off:]
+                        self.score_state[:batch, :remainder] = (
+                            score[:, cut_off:] + self.bias[:remainder]
+                        )
                     kv = kv[:, :cut_off]
                     score = score[:, :cut_off]
 

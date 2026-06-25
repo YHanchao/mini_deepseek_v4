@@ -189,7 +189,6 @@ class Trainer:
         lr: float,
         grad_norm: float,
         step_time: float,
-        rss_mb: float = 0.0,
     ):
         elapsed = time.time() - self._train_start_time
         steps_done = step - self.start_step + 1
@@ -212,8 +211,7 @@ class Trainer:
             f"lr: {lr:.2e} | "
             f"grad_norm: {grad_norm:.4f} | "
             f"tok/s: {tok_per_sec:,.0f} | "
-            f"GPU: {mem_mb:.0f}MB | "
-            f"CPU_RSS: {rss_mb:.0f}MB | "
+            f"mem: {mem_mb:.0f}MB | "
             f"ETA: {eta_days:.1f}d"
         )
 
@@ -316,13 +314,8 @@ class Trainer:
         self._train_start_time = time.time()
         self._current_step = self.start_step
 
-        # Memory tracking
-        _process = psutil.Process()
-        _rss_start_mb = _process.memory_info().rss / 1024**2
-
         if self.is_main:
             self._log(f"Training from step {self.start_step} to {self.total_steps}")
-            self._log(f"Initial CPU RSS: {_rss_start_mb:.0f} MB")
 
         for step in range(self.start_step, self.total_steps):
             # 正式开始训练循环
@@ -361,26 +354,14 @@ class Trainer:
 
             step_time = time.time() - self._step_start_time
 
-            # Log RSS every step (independent of log_every)
-            rss_mb = _process.memory_info().rss / 1024**2
-            rss_growth_mb = rss_mb - _rss_start_mb
+            if step % 50 == 0 or step == self.start_step:
+                self._log(
+                    f"RSS_TRACE step={step} rss_mb={psutil.Process().memory_info().rss/1024**2:.0f}"
+                )
 
             if step % self.log_every == 0:
                 self._log_step(
-                    step,
-                    accum_losses,
-                    self.get_lr(step),
-                    grad_norm,
-                    step_time,
-                    rss_mb=rss_mb,
-                )
-
-            # Per-step RSS trace (appended to log file for analysis)
-            if step % 50 == 0 or step == self.start_step:
-                self._log(
-                    f"RSS_TRACE step={step} rss_mb={rss_mb:.0f} "
-                    f"growth_mb={rss_growth_mb:.0f} "
-                    f"rate_mb_per_step={rss_growth_mb / max(1, step - self.start_step):.3f}"
+                    step, accum_losses, self.get_lr(step), grad_norm, step_time
                 )
 
             if self.val_loader and step % self.val_every == 0 and step > 0:
@@ -461,10 +442,9 @@ class PretrainTrainer(Trainer):
 
         muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
         adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
-        self.optimizers = [muon_opt, adamw_opt]
-        if idx_p:
-            idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
-            self.optimizers.append(idx_opt)
+        idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+
+        self.optimizers = [muon_opt, adamw_opt, idx_opt]
 
         if self.world_size > 1:
             self.model = DDP(
