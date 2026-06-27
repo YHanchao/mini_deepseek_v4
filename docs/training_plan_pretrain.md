@@ -100,4 +100,4 @@ torchrun --nproc_per_node=4 scripts/train.py \
 - [x] **TODO-3**: `src/dataset.py` + `scripts/preprocess_data.py` — 数据预处理管线
 - [x] **TODO-4**: `scripts/train.py` — 正式训练脚本，支持 `--distributed` 开关
 - [x] **TODO-5**: DGX Spark 上用 tiny 冒烟验证（阶段 0）
-- [ ] **TODO-6**: 4×4090 上用 small 正式训练（阶段 1）
+- [x] **TODO-6**: 4×4090 上用 small 正式训练（阶段 1）
