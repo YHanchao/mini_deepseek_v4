@@ -14,7 +14,7 @@
 | Benchmark | ✅ 完成 | DGX Spark + 4×4090 DDP 实测 |
 | 数据预处理 | ✅ 完成 | 3,353,583,956 tokens |
 | 训练脚本 | ✅ 完成 | 无 |
-| 正式预训练 | ✅ 完成 | 在3B token上做 1 个epoch预训练 |
+| 正式预训练 | ✅ 完成 | 305M 参数，~3.3B tokens，1 epoch |
 | 指令微调 | ⏳ 进行中 | 无 |
 
 ## 架构
@@ -41,6 +41,24 @@
 
 详见 [docs/benchmark_results.md](docs/benchmark_results.md) 和 [docs/training_plan.md](docs/training_plan.md)。
 
+## 预训练结果
+
+在 4×RTX 4090 DDP 上完成 305M 模型 1 epoch（~3.3B tokens）预训练。
+
+**最终模型**：`checkpoints/pretrain/ckpt_best.pt`（step 191K, val lm=4.75）
+
+### Scaling Law
+
+验证 loss 严格遵循幂律 $L(T) \propto T^{\alpha}$，$\alpha = -0.0506$，$R^2 = 0.9722$：
+
+![Scaling Law](docs/scaling_law.png)
+
+- 蓝色散点：8M→3.3B tokens，loss 从 8.0 平滑降至 4.75
+- 红色实线：幂律拟合，外推 10B tokens 可降至 ~4.48
+- 黄色星标：ckpt_best 位置（3129M tokens，Chinchilla 比 = 10.3）
+
+**关键结论**：模型架构正确（$R^2$ > 0.97 排除了结构性 bug），验证 loss 严格遵循 scaling law。受限于可用数据量（~3.3B tokens），仅训到 Chinchilla 最优数据量的约一半（10.3/20），换更大数据集仍有可观下降空间。
+
 ## 目录结构
 
 ```
@@ -51,8 +69,8 @@ src/          # 核心代码
   optimizer.py  — Muon, AdamW, lr schedule, grad clip, param grouping
   loss.py       — Cross Entropy + Indexer KL Loss
   kernel.py     — Triton kernel（弃坑）
-  dataset.py    — 数据加载（施工中）
-  trainer.py    — 训练循环（施工中）
+  dataset.py    — 数据加载
+  trainer.py    — 训练循环 + DDP
 scripts/      # 实验脚本
   pre_tokenization.py/sh  — 数据预处理
   train_tokenizer.py/sh   — Tokenizer 训练
