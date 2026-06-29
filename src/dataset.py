@@ -26,3 +26,16 @@ class PretrainDataset(Dataset):
         x = torch.from_numpy(chunk[:-1]).long()
         y = torch.from_numpy(chunk[1:]).long()
         return x, y
+
+
+class SFTDataset(Dataset):
+    def __init__(self, filepath: str):
+        data = torch.load(filepath)
+        self.ids, self.mask = data["input_ids"], data["assistant_mask"]
+        self.num_tokens = len(self.ids) * len(self.ids[0])
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        return self.ids[idx][:-1], self.ids[idx][1:], self.mask[idx][:-1]

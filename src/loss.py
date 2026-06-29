@@ -7,6 +7,17 @@ def cross_entropy(y_true, y_pred):
     return torch.mean(nll)
 
 
+def cross_entropy_masked(y_true, y_pred, mask):
+    # 防止除零
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=y_pred.device, requires_grad=True)
+
+    log_probs = torch.log_softmax(y_pred, dim=-1)
+    nll = -log_probs.gather(dim=-1, index=y_true.unsqueeze(-1)).squeeze(-1)
+    masked_nll = nll * mask.float()
+    return masked_nll.sum() / mask.sum().float()
+
+
 def cross_entropy_chunked(y_true, y_pred, chunk_size=8192):
     vocab_size = y_pred.shape[-1]
     y_pred_flat = y_pred.reshape(-1, vocab_size)
@@ -27,7 +38,9 @@ def cross_entropy_chunked(y_true, y_pred, chunk_size=8192):
         mask = (y_true_flat >= start) & (y_true_flat < end)
         if not mask.any():
             continue
-        log_probs_chunk = y_pred_flat[mask, start:end] - max_val[mask] - log_sum_exp[mask]
+        log_probs_chunk = (
+            y_pred_flat[mask, start:end] - max_val[mask] - log_sum_exp[mask]
+        )
         local_indices = (y_true_flat[mask] - start).long().unsqueeze(-1)
         nll = -log_probs_chunk.gather(dim=-1, index=local_indices).squeeze(-1)
         total_loss += nll.sum()
@@ -52,9 +65,18 @@ def indexer_kl_loss(index_score, compress_topk_idxs, weight_compress):
         scalar KL loss, or 0.0 if no indexer data is available
     """
     if index_score is None or compress_topk_idxs is None or weight_compress is None:
-        return torch.tensor(0.0, device=index_score.device if index_score is not None else
-                           (weight_compress.device if weight_compress is not None else
-                            torch.cuda.current_device()))
+        return torch.tensor(
+            0.0,
+            device=(
+                index_score.device
+                if index_score is not None
+                else (
+                    weight_compress.device
+                    if weight_compress is not None
+                    else torch.cuda.current_device()
+                )
+            ),
+        )
 
     b, s, n_heads, topk = weight_compress.shape
 
@@ -81,4 +103,8 @@ def indexer_kl_loss(index_score, compress_topk_idxs, weight_compress):
 
     # Only count positions that attend to at least one compressed block
     valid = target.sum(dim=-1) > 1e-8  # (b, s)
-    return kl[valid].mean() if valid.any() else torch.tensor(0.0, device=index_score.device)
+    return (
+        kl[valid].mean()
+        if valid.any()
+        else torch.tensor(0.0, device=index_score.device)
+    )

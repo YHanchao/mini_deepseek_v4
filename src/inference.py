@@ -16,7 +16,6 @@ from config import MODEL_CONFIGS, SPECIAL_TOKENS
 from src.deepseek import DeepSeekV4, DSArgs
 from src.tokenizer import BPETokenizer
 
-
 # ======================================================================
 # Sampling utilities
 # ======================================================================
@@ -111,6 +110,9 @@ class InferenceConfig:
     top_p: float = 1.0
     repetition_penalty: float = 1.1
 
+    # Chat
+    system_prompt: str = "You are a helpful assistant."
+
     # EOS
     eos_token: str = "<|endoftext|>"
 
@@ -161,9 +163,11 @@ class InferenceEngine:
 
         torch.set_default_device(old_device)
 
-        print(f"InferenceEngine ready: step={self._step}, "
-              f"d_model={self._model_args.d_model}, "
-              f"n_layer={self._model_args.n_layer}")
+        print(
+            f"InferenceEngine ready: step={self._step}, "
+            f"d_model={self._model_args.d_model}, "
+            f"n_layer={self._model_args.n_layer}"
+        )
 
     def build_model(self):
         """Build model from config and load checkpoint."""
@@ -253,7 +257,9 @@ class InferenceEngine:
     # Sampling  (override for custom strategies)
     # ------------------------------------------------------------------
 
-    def sample(self, logits: torch.Tensor, generated_ids: Optional[List[int]] = None) -> torch.Tensor:
+    def sample(
+        self, logits: torch.Tensor, generated_ids: Optional[List[int]] = None
+    ) -> torch.Tensor:
         """Sample next token.  Default: top-k temperature sampling with rep penalty.
 
         Override for custom strategies (e.g. beam search).
@@ -261,10 +267,20 @@ class InferenceEngine:
         if self.config.temperature <= 0:
             return sample_greedy(logits)
         if self.config.top_p < 1.0:
-            return sample_top_p(logits, self.config.temperature, self.config.top_p,
-                                generated_ids, self.config.repetition_penalty)
-        return sample_top_k(logits, self.config.temperature, self.config.top_k,
-                            generated_ids, self.config.repetition_penalty)
+            return sample_top_p(
+                logits,
+                self.config.temperature,
+                self.config.top_p,
+                generated_ids,
+                self.config.repetition_penalty,
+            )
+        return sample_top_k(
+            logits,
+            self.config.temperature,
+            self.config.top_k,
+            generated_ids,
+            self.config.repetition_penalty,
+        )
 
     # ------------------------------------------------------------------
     # Generation
@@ -299,10 +315,21 @@ class InferenceEngine:
     def _generate_one(self, prompt: str) -> str:
         """Generate for a single prompt (KV cache must be reset by caller)."""
         token_ids, eos_id = self.preprocess(prompt)
+        result_ids = self._generate_from_ids(token_ids, eos_id)
+        return self.postprocess(result_ids)
+
+    def _generate_from_ids(
+        self, token_ids: list, eos_id: Optional[int]
+    ) -> list:
+        """Raw generation from token IDs: prefill + autoregressive decode.
+
+        Returns the full token-id list (prompt + generated tokens).
+        Does NOT call preprocess / postprocess — callers handle that.
+        """
         prompt_len = len(token_ids)
 
         if prompt_len == 0:
-            return ""
+            return []
         if prompt_len < self._min_prompt_tokens:
             raise ValueError(
                 f"Prompt too short: {prompt_len} tokens < "
@@ -310,9 +337,7 @@ class InferenceEngine:
                 f"Use a longer prompt."
             )
 
-        prompt_tensor = torch.tensor(
-            [token_ids], dtype=torch.long, device=self.device
-        )
+        prompt_tensor = torch.tensor([token_ids], dtype=torch.long, device=self.device)
 
         # ---- prefill ----
         ntp, _, _ = self.model(prompt_tensor, start_pos=0)
@@ -331,7 +356,7 @@ class InferenceEngine:
             if eos_id is not None and token_id == eos_id:
                 break
 
-        return self.postprocess(token_ids + generated)
+        return token_ids + generated
 
 
 # ======================================================================
@@ -340,27 +365,159 @@ class InferenceEngine:
 
 
 class ChatEngine(InferenceEngine):
-    """Inference engine with chat-template support.
+    """Inference engine with chat-template + multi-turn conversation support.
 
-    Wraps user prompts in ``<|user|>\\n...\\n<|assistant|>\\n`` format
-    and extracts only the assistant's reply from the generated output.
+    Matches the SFT training format (see ``scripts/preprocess_sft.py``)::
+
+        <|system|>\\n{system_prompt}\\n
+        <|user|>\\n{msg}\\n<|assistant|>\\n{resp}<|endoftext|>\\n
+        <|user|>\\n{msg}\\n<|assistant|>\\n{resp}<|endoftext|>\\n
+        ...
+        <|user|>\\n{msg}\\n<|assistant|>\\n
+
+    Usage::
+
+        engine = ChatEngine(config)
+        engine.setup()
+
+        # Single-turn (backward-compat)
+        engine.generate("What is ML?")
+
+        # Multi-turn
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is ML?"},
+            {"role": "assistant", "content": "ML is a field of AI."},
+            {"role": "user", "content": "Tell me more."},
+        ]
+        reply = engine.chat(messages)  # generates the next assistant reply
     """
 
     def __init__(self, config: InferenceConfig):
         super().__init__(config)
+        self._system_tag = "<|system|>"
         self._user_tag = "<|user|>"
         self._assistant_tag = "<|assistant|>"
+        self._eot_tag = "<|endoftext|>"
+
+    # ------------------------------------------------------------------
+    # Conversation formatting
+    # ------------------------------------------------------------------
+
+    def format_conversation(self, messages: list[dict]) -> str:
+        """Format a list of message dicts to the SFT training template.
+
+        Each message is ``{"role": "system|user|assistant", "content": "..."}``.
+
+        Rules:
+        - If no system message is present, prepend the default system prompt.
+        - Each assistant turn is terminated with ``<|endoftext|>\\n``.
+        - If the last message is from a user, append ``<|assistant|>\\n``
+          as the generation prompt.
+        """
+        parts: list[str] = []
+        has_system = any(m.get("role") == "system" for m in messages)
+
+        if not has_system:
+            parts.append(f"{self._system_tag}\n{self.config.system_prompt}\n")
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                parts.append(f"{self._system_tag}\n{content}\n")
+            elif role == "user":
+                parts.append(f"{self._user_tag}\n{content}\n")
+            elif role == "assistant":
+                parts.append(f"{self._assistant_tag}\n{content}{self._eot_tag}\n")
+
+        # If the last message is not assistant → append the generation prompt
+        last_role = messages[-1].get("role", "") if messages else ""
+        if last_role != "assistant":
+            parts.append(f"{self._assistant_tag}\n")
+
+        return "".join(parts)
+
+    # ------------------------------------------------------------------
+    # Multi-turn generation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def chat(self, messages: list[dict]) -> str:
+        """Generate the assistant reply for a (potentially multi-turn) conversation.
+
+        Args:
+            messages: list of ``{"role": "...", "content": "..."}`` dicts.
+                      The last message should typically be from ``"user"``.
+
+        Returns:
+            The model's assistant reply text (without role tags).
+        """
+        formatted = self.format_conversation(messages)
+        ids = self.tokenizer.encode(formatted)
+        eos_id = self.tokenizer._special_token_to_id.get(
+            self.config.eos_token.encode(), None
+        )
+
+        self.reset_kv_cache()
+        result_ids = self._generate_from_ids(ids, eos_id)
+        return self._extract_assistant_response(result_ids)
+
+    # ------------------------------------------------------------------
+    # Pre / Post processing  (backward-compatible single-turn)
+    # ------------------------------------------------------------------
 
     def preprocess(self, prompt: str):
-        """Insert chat template before tokenization."""
-        formatted = f"{self._user_tag}\n{prompt}\n{self._assistant_tag}\n"
+        """Single-turn: wrap with system + user + assistant template."""
+        messages = [
+            {"role": "system", "content": self.config.system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        formatted = self.format_conversation(messages)
         return super().preprocess(formatted)
 
     def postprocess(self, ids: list) -> str:
-        """Return only the text after the first <|assistant|> marker."""
+        """Extract only the assistant reply from generated output."""
+        return self._extract_assistant_response(ids)
+
+    def _extract_assistant_response(self, ids: list) -> str:
+        """Extract text after the *last* ``<|assistant|>\\n`` marker.
+
+        Strips trailing ``<|endoftext|>`` if present.
+        """
         full_text = super().postprocess(ids)
         marker = f"{self._assistant_tag}\n"
-        idx = full_text.find(marker)
-        if idx != -1:
-            return full_text[idx + len(marker):]
-        return full_text
+        idx = full_text.rfind(marker)
+        if idx == -1:
+            return full_text
+        text = full_text[idx + len(marker):]
+        eot = text.find(self._eot_tag)
+        if eot != -1:
+            text = text[:eot]
+        return text.strip()
+
+    # ------------------------------------------------------------------
+    # generate() override — single-turn chat
+    # ------------------------------------------------------------------
+
+    def generate(self, prompt):
+        """Override: ``generate()`` on ChatEngine is single-turn chat.
+
+        Automatically wraps with system prompt.  For multi-turn
+        conversations, use :meth:`chat` directly.
+        """
+        if isinstance(prompt, str):
+            messages = [
+                {"role": "system", "content": self.config.system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            return self.chat(messages)
+        else:
+            results = []
+            for p in prompt:
+                messages = [
+                    {"role": "system", "content": self.config.system_prompt},
+                    {"role": "user", "content": p},
+                ]
+                results.append(self.chat(messages))
+            return results

@@ -15,8 +15,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from config import MODEL_CONFIGS
 from src.deepseek import DeepSeekV4, DSArgs
-from src.dataset import PretrainDataset
-from src.loss import cross_entropy, indexer_kl_loss
+from src.dataset import PretrainDataset, SFTDataset
+from src.loss import cross_entropy, indexer_kl_loss, cross_entropy_masked
 from src.optimizer import (
     Muon,
     AdamW,
@@ -63,6 +63,29 @@ class PretrainTrainerArgs(TrainerArgs):
     # Data
     data_train: str = ""
     data_val: str = ""
+
+    # Optimization
+    lr: float = 2.7e-4
+    lr_min: float = 2.7e-5
+    warmup_steps: int = 2000
+
+    # Data loading
+    num_workers: int = 0
+
+
+@dataclass
+class SFTTrainerArgs(TrainerArgs):
+    # Model
+    config_name: str = "small"
+    base_model_path: str = ""
+
+    # Data
+    data_train: str = ""
+    data_val: str = ""
+
+    # Use pretrain
+    use_pretrain: bool = False
+    pretrain_ratio: float = 0.05
 
     # Optimization
     lr: float = 2.7e-4
@@ -377,7 +400,7 @@ class Trainer:
                         self.wandb_run.log(val_metrics, step=step)
 
                 val_lm = val_metrics.get("val/lm_loss", float("inf"))
-                if val_lm < self.best_val_loss:
+                if val_lm <= self.best_val_loss:
                     self.best_val_loss = val_lm
                     self.save_checkpoint(
                         os.path.join(self.output_dir, "ckpt_best.pt"),
@@ -595,6 +618,256 @@ class PretrainTrainer(Trainer):
             total_ntp += cross_entropy(target_ids, ntp).item()
             total_mtp += sum(
                 cross_entropy(target_ids[:, i + 1 :], m[:, : -(i + 1)]).item()
+                for i, m in enumerate(mtp_list)
+            )
+            total_kl += sum(
+                indexer_kl_loss(iscore, idx, wc).item()
+                for (iscore, wc, idx) in idx_data
+            )
+            num_batches += 1
+
+        self.model.train()
+
+        avg_ntp = total_ntp / num_batches
+        avg_mtp = total_mtp / num_batches
+        avg_kl = total_kl / num_batches
+        avg_lm = avg_ntp + 0.3 * avg_mtp
+
+        if self.world_size > 1:
+            losses_t = torch.tensor(
+                [avg_ntp, avg_mtp, avg_kl, avg_lm],
+                device=self.local_rank,
+            )
+            dist.all_reduce(losses_t, op=dist.ReduceOp.SUM)
+            losses_t /= self.world_size
+            avg_ntp, avg_mtp, avg_kl, avg_lm = losses_t.tolist()
+
+        return {
+            "val/ntp_loss": avg_ntp,
+            "val/mtp_loss": avg_mtp,
+            "val/kl_loss": avg_kl,
+            "val/lm_loss": avg_lm,
+        }
+
+    # ------------------------------------------------------------------
+    # LR schedule
+    # ------------------------------------------------------------------
+
+    def get_lr(self, step: int) -> float:
+        return cosine_annealing_lr_schedule(
+            step, self.lr, self.lr_min, self.warmup_steps, self.total_steps
+        )
+
+    # ------------------------------------------------------------------
+    # Optimizer step
+    # ------------------------------------------------------------------
+
+    def _optimizer_step(self) -> float:
+        gn = grad_clip(self.model.parameters(), self.max_grad_norm)
+        for opt in self.optimizers:
+            opt.step()
+        self.model.zero_grad()
+        return gn
+
+
+class SFTTrainer(Trainer):
+    """
+    SFT部分基本上和pretrain保持一致
+    """
+
+    def __init__(self, args: SFTTrainerArgs):
+        super().__init__(args)
+        self._model_args: Optional[DSArgs] = None
+        self.base_model_ckpt_path = args.base_model_path
+
+    def build_model_and_optimizers(self):
+        cfg = MODEL_CONFIGS[self.config_name].copy()
+        cfg["max_seq_len"] = self.max_seq_len
+        self.max_seq_len = cfg["max_seq_len"]
+
+        base_fields = DSArgs.__dataclass_fields__
+        args = DSArgs(**{k: v for k, v in cfg.items() if k in base_fields})
+
+        needed = args.n_layer + args.n_mtp_layer
+        if len(args.compress_ratios) < needed:
+            args.compress_ratios = args.compress_ratios + tuple(
+                [0] * (needed - len(args.compress_ratios))
+            )  # MTP layer当时没有写compress_ratios，当时只写了前面block的，打个补丁
+
+        self._model_args = args
+
+        model = DeepSeekV4(args)
+        model.train()
+        model = model.to(self.local_rank)
+
+        # 和pretrain相比只多出来加载权重
+        ckpt = torch.load(
+            self.base_model_ckpt_path,
+            map_location=f"cuda:{self.local_rank}",
+            weights_only=False,
+        )
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        muon_p, adamw_p = group_params(model)
+        idx_p = get_indexer_params(model)
+
+        muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
+        adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+        idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+
+        self.optimizers = [muon_opt, adamw_opt, idx_opt]
+
+        if self.world_size > 1:
+            self.model = DDP(
+                model, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+        else:
+            self.model = model
+
+        if self.is_main:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            self._log(
+                f"Model: {self.config_name} | "
+                f"Params: {total_params/1e6:.1f}M total, {trainable/1e6:.1f}M trainable | "
+                f"d_model={args.d_model}, n_layer={args.n_layer}, "
+                f"n_experts={args.n_experts}, seq_len={args.max_seq_len}"
+            )
+
+    def build_dataloaders(self):
+        if not self.data_train:
+            raise ValueError("--data-train is required")
+
+        train_dataset = SFTDataset(self.data_train)
+        train_sampler = None
+        if self.world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False,
+            )
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        if self.data_val:
+            val_dataset = SFTDataset(self.data_val)
+            val_sampler = None
+            if self.world_size > 1:
+                val_sampler = DistributedSampler(
+                    val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=False,
+                )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+        else:
+            self.val_loader = None
+
+        if self.is_main:
+            n_tokens = train_dataset.num_tokens
+            self._log(
+                f"Train data: {self.data_train} | "
+                f"{n_tokens/1e6:.0f}M tokens, "
+                f"{len(train_dataset):,} samples | "
+                f"batch={self.batch_size}, seq_len={self.max_seq_len}"
+            )
+            if self.val_loader:
+                self._log(
+                    f"Val data: {self.data_val} | "
+                    f"{val_dataset.num_tokens/1e6:.0f}M tokens, "
+                    f"{len(val_dataset):,} samples"
+                )
+
+    # ------------------------------------------------------------------
+    # Training step
+    # ------------------------------------------------------------------
+
+    def train_step(self, batch, is_last_micro: bool) -> Dict[str, float]:
+        input_ids, target_ids, masks = batch
+        input_ids = input_ids.to(self.local_rank, non_blocking=True)
+        target_ids = target_ids.to(self.local_rank, non_blocking=True)
+        masks = masks.to(self.local_rank, non_blocking=True)
+
+        ntp, mtp_list, idx_data = self.model(input_ids)
+
+        ntp_loss = cross_entropy_masked(target_ids, ntp, masks)
+        mtp_loss = sum(
+            cross_entropy_masked(
+                target_ids[:, i + 1 :], m[:, : -(i + 1)], masks[:, : -(i + 1)]
+            )
+            for i, m in enumerate(mtp_list)
+        )
+        kl_loss = sum(
+            indexer_kl_loss(iscore, idx, wc.detach() if wc is not None else None)
+            for (iscore, wc, idx) in idx_data
+        )
+
+        lm_loss = ntp_loss + 0.3 * mtp_loss
+        total_loss = (lm_loss + 0.5 * kl_loss) / self.grad_accum
+
+        if self.world_size > 1 and not is_last_micro:
+            with self.model.no_sync():
+                total_loss.backward()
+        else:
+            total_loss.backward()
+
+        return {
+            "ntp": ntp_loss.item(),
+            "mtp": mtp_loss.item(),
+            "kl": kl_loss.item(),
+            "lm": lm_loss.item(),
+        }
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def validate(self, max_val_batches: int = 100) -> Dict[str, float]:
+        if not self.val_loader:
+            return {}
+
+        self.model.eval()
+
+        total_ntp = 0.0
+        total_mtp = 0.0
+        total_kl = 0.0
+        num_batches = 0
+
+        for batch in self.val_loader:
+            if num_batches >= max_val_batches:
+                break
+
+            input_ids, target_ids, masks = batch
+            input_ids = input_ids.to(self.local_rank, non_blocking=True)
+            target_ids = target_ids.to(self.local_rank, non_blocking=True)
+            masks = masks.to(self.local_rank, non_blocking=True)
+
+            ntp, mtp_list, idx_data = self.model(input_ids)
+
+            total_ntp += cross_entropy_masked(target_ids, ntp, masks).item()
+            total_mtp += sum(
+                cross_entropy_masked(
+                    target_ids[:, i + 1 :], m[:, : -(i + 1)], masks[:, : -(i + 1)]
+                ).item()
                 for i, m in enumerate(mtp_list)
             )
             total_kl += sum(
