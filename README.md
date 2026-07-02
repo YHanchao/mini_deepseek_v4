@@ -1,6 +1,6 @@
 # Reproduction of DeepSeek-V4 (mini version)
 
-从零复现 DeepSeek-V4 架构，使用 4×RTX 4090 DDP 训练一个 305M 参数的 mini 版本。
+从零复现 DeepSeek-V4 架构，使用 5×RTX 4090 DDP 训练一个 305M 参数的 mini 版本。
 
 ## 施工进度
 
@@ -14,8 +14,8 @@
 | Benchmark | ✅ 完成 | DGX Spark + 4×4090 DDP 实测 |
 | 数据预处理 | ✅ 完成 | 3,353,583,956 tokens |
 | 训练脚本 | ✅ 完成 | 无 |
-| 正式预训练 | ✅ 完成 | 305M 参数，~3.3B tokens，1 epoch |
-| 指令微调 | ⏳ 进行中 | 无 |
+| 正式预训练 | ✅ 完成 | 305M 参数，~7.5B tokens |
+| 指令微调 | ✅ 完成 | 65M tokens SFT 数据，~129M tokens 训练 |
 
 ## 架构
 
@@ -43,21 +43,31 @@
 
 ## 预训练结果
 
-在 4×RTX 4090 DDP 上完成 305M 模型 1 epoch（~3.3B tokens）预训练。
+在 4×RTX 4090 DDP（后期扩至 5×RTX 4090）上完成 305M 模型 ~7.6B tokens 预训练。
 
-**最终模型**：`checkpoints/pretrain/ckpt_best.pt`（step 191K, val lm=4.75）
+**最终模型**：`checkpoints/pretrain_20260701/ckpt_0375000.pt`（step 375K, val lm = 4.69）
 
-### Scaling Law
+### 预训练 Scaling Law
 
-验证 loss 严格遵循幂律 $L(T) \propto T^{\alpha}$，$\alpha = -0.0506$，$R^2 = 0.9722$：
+验证 loss 遵循幂律 $L(T) \propto T^{\alpha}$，$\alpha = -0.0462$，$R^2 = 0.9756$：
 
-![Scaling Law](docs/scaling_law.png)
+![Pretrain Scaling Law](docs/scaling_law_pretrain.png)
 
-- 蓝色散点：8M→3.3B tokens，loss 从 8.0 平滑降至 4.75
-- 红色实线：幂律拟合，外推 10B tokens 可降至 ~4.48
-- 黄色星标：ckpt_best 位置（3129M tokens，Chinchilla 比 = 10.3）
+- 蓝色散点：~7.6B tokens，loss 从 8.0 降至 4.69
+- 红色实线：幂律拟合
+- 黄色星标：ckpt_final（step 375K，~7.6B tokens，Chinchilla 比 = 24.8）
 
-**关键结论**：模型架构正确（$R^2$ > 0.97 排除了结构性 bug），验证 loss 严格遵循 scaling law。受限于可用数据量（~3.3B tokens），仅训到 Chinchilla 最优数据量的约一半（10.3/20），换更大数据集仍有可观下降空间。
+## 指令微调结果
+
+在 5×RTX 4090 DDP 上完成 SFT，训练 6,378 steps（~129M tokens，约 2 epochs）。
+
+**最终模型**：`checkpoints/sft/ckpt_final.pt`（step 6,378, val lm = 3.58）
+
+### SFT Loss 曲线
+
+![SFT Loss](docs/scaling_law_sft.png)
+
+- val lm 从 3.72 降至 3.58，约 2,400 steps 后迅速收敛
 
 ## 目录结构
 
@@ -101,25 +111,37 @@ TOKENIZER_NAME=tokenizer VOCAB_SIZE=32000 CHUNK_SIZE=1073741824 bash scripts/tra
 # 预处理 pretrain 数据集
 bash scripts/pre_tokenization.sh
 
-# 验证 tokenization 结果
-python scripts/verify_tokenization.py \
-    --bin data/train.bin \
-    --vocab checkpoints/tokenizer_vocab.json \
-    --merges checkpoints/tokenizer_merges.txt
-
-python scripts/verify_tokenization.py \
-    --bin data/valid.bin \
-    --vocab checkpoints/tokenizer_vocab.json \
-    --merges checkpoints/tokenizer_merges.txt
-
-# 验证模型前向+反向+优化器（随机数据，150 步）
-python scripts/verify_training.py --config small
-
 # Benchmark 单卡吞吐
 python scripts/benchmark.py --config small
 
 # 预训练
-torchrun --nproc_per_node=4 scripts/pretrain.py \
-    --data-train /data/train.bin \
-    --data-val  /data/valid.bin
+torchrun --nproc_per_node=5 scripts/pretrain.py \
+    --data-train data/train_large.bin \
+    --data-val data/valid.bin \
+    --total-steps 375000 \
+    --warmup-steps 2000 \
+    --log-every 10 \
+    --output-dir checkpoints/pretrain \
+    --ckpt-every 5000
+
+# SFT
+orchrun --nproc_per_node=5 scripts/sft.py \
+    --data-train /mnt/MiniDSv4/data/sft/train.pt \
+    --data-val /mnt/MiniDSv4/data/sft/valid.pt \
+    --wandb-project mini_deepseek_v4 \
+    --base-model-path checkpoints/pretrain/ckpt_0375000.pt \
+    --total-steps 6378 \
+    --lr 1e-4 \
+    --lr-min 1e-5 \
+    --warmup-steps 300 \
+    --val-every 300 \
+    --ckpt-every 2000 \
+    --output-dir checkpoints/sft
+
+# 推理（预训练）
+python scripts/inference.py checkpoints/pretrain/ckpt_0375000.pt  # 调试用，预训练model
+python scripts/inference.py checkpoints/pretrain/ckpt_0375000.pt --interactive  # 交互式，预训练model
+python scripts/inference.py checkpoints/pretrain/ckpt_0375000.pt --input prompts.txt  # 交互式，预训练model，batch预测
+python scripts/inference.py checkpoints/pretrain/ckpt_0375000.pt --prompt "Once upon a time" # 预训练model，指定prompt
+python scripts/inference.py checkpoints/sft/ckpt_final.pt --chat --prompt "Hello" #
 ```
