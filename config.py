@@ -1,6 +1,6 @@
 SPECIAL_TOKENS = [
     "<|endoftext|>",
-    "<|beginoftext|>" "<|pad|>",
+    "<|beginoftext|>",
     "<|user|>",
     "<|assistant|>",
     "<|system|>",
