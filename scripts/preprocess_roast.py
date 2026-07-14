@@ -1,15 +1,18 @@
 """
-Preprocess roast_dataset.jsonl for SFT, Off-policy GRPO, On-policy GRPO, and Test.
+Preprocess roast_dataset.jsonl for SFT, Off-policy GRPO, On-policy GRPO, and Validation.
 
 Usage:
     python scripts/preprocess_roast.py
 
 Output:
     data/llm/roast/sft/train.pt
-    data/llm/roast/test/sft.pt
-    data/llm/roast/test/grpo.pt
+    data/llm/roast/val/sft.pt
+    data/llm/roast/val/grpo.pt
     data/llm/roast/grpo_offpolicy/train.pt
     data/llm/roast/grpo_onpolicy/train.pt
+
+Records with missing candidate scores (filtered low-quality candidates) are excluded
+from GRPO splits but their winners are still used for SFT training.
 """
 
 import argparse
@@ -34,10 +37,58 @@ EOS_ID = 256
 PAD_ID = 256
 RANDOM_SEED = 42
 
-TEST_RATIO = 0.10
-SFT_RATIO = 0.50
-OFFPOLICY_RATIO = 0.30
+VAL_RATIO = 0.10
+SFT_RATIO = 0.60
 ONPOLICY_RATIO = 0.10
+OFFPOLICY_RATIO = 0.20
+
+
+# ── Response Cleaning ────────────────────────────────────────────────────────
+
+# Prefix artifacts from LLM synthesis — strip aggressively
+_PREFIX_ARTIFACTS = [
+    "GOOD: ",
+    "GOOD:\n\n",
+    "GOOD:\n",
+    "BAD: ",
+    "ROAST: ",
+    "OK: ",
+    "MEH: ",
+    "(Observing the specific absurdity)\n\n",
+    "(Observing the specific absurdity)\n",
+]
+
+
+def clean_response(text: str) -> str:
+    """Strip known LLM synthesis artifacts from a candidate response."""
+    for prefix in _PREFIX_ARTIFACTS:
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+
+    # Strip bracketed stage directions: [DEADPAN]\n\n, [Deadpan] , etc.
+    import re
+
+    text = re.sub(
+        r"^\[(?:DEADPAN|Deadpan|deadpan|Flat tone|flatly[^]]*|SOUNDLEVEL[^]]*|WILDLIFE DOCUMENTARY|A host[^]]*|A man[^]]*)\]\s*\n*",
+        "",
+        text,
+    )
+
+    # Strip markdown document headers at start of line
+    # e.g. "**ABSTRACT:** ", "**Abstract**\n", "**Performance Review – ...**\n"
+    text = re.sub(r"^\*\*[^*]+\*\*[:\s]*\n*", "", text)
+    # Second pass: some have multiple headers
+    text = re.sub(r"^\*\*[^*]+\*\*[:\s]*\n*", "", text)
+
+    # Strip "**OBSERVATION:** ... **ROAST:** ..." structured format
+    text = re.sub(r"^\*\*OBSERVATION:?\*\*[^*]*\*\*ROAST:?\*\*\s*", "", text)
+    text = re.sub(r"^\*\*OBSERVE:?\*\*\s*[^*]+\n", "", text)
+
+    # Strip leading/trailing whitespace
+    text = text.strip()
+
+    return text
 
 
 # ── Segment Builders ─────────────────────────────────────────────────────────
@@ -140,7 +191,8 @@ def process_sft(
     lengths: list[int] = []
 
     for rec in records:
-        segments = build_sft_segments(rec["user_input"], rec["winner_response"])
+        winner_text = clean_response(rec["winner_response"])
+        segments = build_sft_segments(rec["user_input"], winner_text)
         ids, mask = tokenize_segments(segments, tokenizer, max_seq_len)
 
         actual_len = sum(len(tokenizer.encode(text)) for text, _ in segments)
@@ -172,7 +224,8 @@ def process_grpo_offpolicy(
     for group_id, rec in enumerate(records):
         winner_idx = rec["editor"]["winner_index"]
         for cand in rec["candidates"]:
-            segments = build_sft_segments(rec["user_input"], cand["response"])
+            cleaned_resp = clean_response(cand["response"])
+            segments = build_sft_segments(rec["user_input"], cleaned_resp)
             ids, mask = tokenize_segments(segments, tokenizer, max_seq_len)
 
             actual_len = sum(len(tokenizer.encode(text)) for text, _ in segments)
@@ -230,7 +283,7 @@ def process_grpo_onpolicy(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Roast 数据预处理")
     parser.add_argument(
-        "--data-file", default="data/llm/roast_dataset.jsonl", help="原始 JSONL 路径"
+        "--data-file", default="data/llm/roast_dataset_v4.jsonl", help="原始 JSONL 路径"
     )
     parser.add_argument("--output-dir", default="data/llm/roast", help="输出目录")
     parser.add_argument(
@@ -260,63 +313,84 @@ def main() -> None:
 
     # ── 2. Load data ──
     print(f"[preprocess_roast] Loading {args.data_file}...")
-    records: list[dict] = []
+    all_records: list[dict] = []
     with open(args.data_file) as f:
         for line in f:
-            records.append(json.loads(line))
-    print(f"  → {len(records)} records")
+            all_records.append(json.loads(line))
+    print(f"  → {len(all_records)} records")
 
-    # ── 2.5. Filter records missing scores for any candidate ──
-    before = len(records)
-    records = [
-        r
-        for r in records
-        if all(
-            str(c["index"]) in r["editor"]["scores"] for c in r["candidates"]
-        )
-    ]
+    # ── 2.5. Separate clean (all 4 candidates scored) vs dirty (some missing) ──
+    def _has_all_scores(rec: dict) -> bool:
+        for c in rec["candidates"]:
+            k = str(c["index"])
+            if k not in rec["editor"]["scores"]:
+                return False
+            s = rec["editor"]["scores"][k]
+            if len(s) == 0:
+                return False
+            if any(v is None for v in s.values()):
+                return False
+        return True
+
+    # Normalise known typos in score keys
+    for rec in all_records:
+        for c in rec["candidates"]:
+            k = str(c["index"])
+            if k in rec["editor"]["scores"]:
+                s = rec["editor"]["scores"][k]
+                if "ecomony" in s:
+                    s["economy"] = s.pop("ecomony")
+
+    clean_records = [r for r in all_records if _has_all_scores(r)]
+    dirty_records = [r for r in all_records if not _has_all_scores(r)]
     print(
-        f"  → {len(records)} records after dropping "
-        f"{before - len(records)} with missing scores ({100 * (before - len(records)) / before:.1f}%)"
+        f"  → {len(clean_records)} clean (all candidates scored), "
+        f"{len(dirty_records)} dirty (partial scores → winners → SFT only)"
     )
 
-    # ── 3. Shuffle & split ──
-    random.shuffle(records)
+    # ── 3. Shuffle & split clean records ──
+    random.shuffle(clean_records)
 
-    n = len(records)
-    n_test = int(n * TEST_RATIO)
-    n_sft = int(n * SFT_RATIO)
-    n_offpolicy = int(n * OFFPOLICY_RATIO)
+    n_clean = len(clean_records)
+    n_val = int(n_clean * VAL_RATIO)
+    n_sft_clean = int(n_clean * SFT_RATIO)
+    n_onpolicy = int(n_clean * ONPOLICY_RATIO)
 
-    test_records = records[:n_test]
-    sft_records = records[n_test : n_test + n_sft]
-    offpolicy_records = records[n_test + n_sft : n_test + n_sft + n_offpolicy]
-    onpolicy_records = records[n_test + n_sft + n_offpolicy :]
+    val_records = clean_records[:n_val]
+    sft_clean_records = clean_records[n_val : n_val + n_sft_clean]
+    onpolicy_records = clean_records[
+        n_val + n_sft_clean : n_val + n_sft_clean + n_onpolicy
+    ]
+    offpolicy_records = clean_records[n_val + n_sft_clean + n_onpolicy :]
+
+    # Dirty records → SFT train only (winners always have scores)
+    sft_records = sft_clean_records + dirty_records
+    random.shuffle(sft_records)
 
     print(
         f"\n[preprocess_roast] Split: "
-        f"test={len(test_records)}, "
-        f"sft={len(sft_records)}, "
+        f"val={len(val_records)}, "
+        f"sft={len(sft_records)} ({len(sft_clean_records)} clean + {len(dirty_records)} dirty), "
         f"offpolicy={len(offpolicy_records)}, "
         f"onpolicy={len(onpolicy_records)}"
     )
 
     # ── 4. Process each split ──
 
-    print("\n[preprocess_roast] Processing test (SFT format)...")
-    test_sft_ids, test_sft_mask, test_sft_lens = process_sft(
-        test_records, tokenizer, args.max_seq_len
+    print("\n[preprocess_roast] Processing val (SFT format)...")
+    val_sft_ids, val_sft_mask, val_sft_lens = process_sft(
+        val_records, tokenizer, args.max_seq_len
     )
 
-    print("[preprocess_roast] Processing test (GRPO format)...")
+    print("[preprocess_roast] Processing val (GRPO format)...")
     (
-        test_grpo_ids,
-        test_grpo_cmask,
-        test_grpo_scores,
-        test_grpo_gids,
-        test_grpo_winner,
-        test_grpo_lens,
-    ) = process_grpo_offpolicy(test_records, tokenizer, args.max_seq_len)
+        val_grpo_ids,
+        val_grpo_cmask,
+        val_grpo_scores,
+        val_grpo_gids,
+        val_grpo_winner,
+        val_grpo_lens,
+    ) = process_grpo_offpolicy(val_records, tokenizer, args.max_seq_len)
 
     print("[preprocess_roast] Processing SFT train...")
     sft_ids, sft_mask, sft_lens = process_sft(
@@ -345,7 +419,7 @@ def main() -> None:
 
     # ── 6. Save ──
     os.makedirs(os.path.join(args.output_dir, "sft"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "test"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "val"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "grpo_offpolicy"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "grpo_onpolicy"), exist_ok=True)
 
@@ -357,16 +431,16 @@ def main() -> None:
         print(f"  → {path} ({os.path.getsize(path) / 1024**2:.1f} MB)")
 
     save_pt("sft", "train.pt", {"input_ids": sft_ids, "assistant_mask": sft_mask})
-    save_pt("test", "sft.pt", {"input_ids": test_sft_ids, "assistant_mask": test_sft_mask})
+    save_pt("val", "sft.pt", {"input_ids": val_sft_ids, "assistant_mask": val_sft_mask})
     save_pt(
-        "test",
+        "val",
         "grpo.pt",
         {
-            "input_ids": test_grpo_ids,
-            "completion_mask": test_grpo_cmask,
-            "scores": test_grpo_scores,
-            "group_ids": test_grpo_gids,
-            "is_winner": test_grpo_winner,
+            "input_ids": val_grpo_ids,
+            "completion_mask": val_grpo_cmask,
+            "scores": val_grpo_scores,
+            "group_ids": val_grpo_gids,
+            "is_winner": val_grpo_winner,
         },
     )
     save_pt(
@@ -389,12 +463,12 @@ def main() -> None:
     # ── 7. Statistics ──
     print(f"\n[preprocess_roast] === Statistics ===")
     print(
-        f"Test (SFT):     {len(test_sft_ids):>5} samples, "
-        f"avg_len={np.mean(test_sft_lens):.0f}"
+        f"Val (SFT):      {len(val_sft_ids):>5} samples, "
+        f"avg_len={np.mean(val_sft_lens):.0f}"
     )
     print(
-        f"Test (GRPO):    {len(test_grpo_ids):>5} rows "
-        f"({len(test_records)} groups), avg_len={np.mean(test_grpo_lens):.0f}"
+        f"Val (GRPO):     {len(val_grpo_ids):>5} rows "
+        f"({len(val_records)} groups), avg_len={np.mean(val_grpo_lens):.0f}"
     )
     print(
         f"SFT train:      {len(sft_ids):>5} samples, "
@@ -408,6 +482,9 @@ def main() -> None:
         f"On-policy:      {len(on_ids):>5} samples, "
         f"avg_len={np.mean(on_lens):.0f}"
     )
+    print(
+        f"Total prompts:  {len(val_records) + len(sft_records) + len(offpolicy_records) + len(onpolicy_records)}"
+    )
 
     # ── 8. Verify ──
     if args.no_verify:
@@ -416,19 +493,19 @@ def main() -> None:
 
     print("\n[preprocess_roast] === Verification ===")
 
-    assert len(test_sft_ids) == len(
-        test_records
-    ), f"Test SFT: {len(test_sft_ids)} != {len(test_records)}"
-    assert len(test_grpo_ids) == 4 * len(
-        test_records
-    ), f"Test GRPO rows: {len(test_grpo_ids)} != 4*{len(test_records)}"
-    assert test_grpo_winner.sum().item() == len(
-        test_records
-    ), f"Test winners: {test_grpo_winner.sum()} != {len(test_records)}"
+    assert len(val_sft_ids) == len(
+        val_records
+    ), f"Val SFT: {len(val_sft_ids)} != {len(val_records)}"
+    assert len(val_grpo_ids) == 4 * len(
+        val_records
+    ), f"Val GRPO rows: {len(val_grpo_ids)} != 4*{len(val_records)}"
+    assert val_grpo_winner.sum().item() == len(
+        val_records
+    ), f"Val winners: {val_grpo_winner.sum()} != {len(val_records)}"
 
-    # Verify each group has exactly 1 winner
-    for gid in range(len(test_records)):
-        group_winners = test_grpo_winner[test_grpo_gids == gid]
+    # Verify each val group has exactly 1 winner
+    for gid in range(len(val_records)):
+        group_winners = val_grpo_winner[val_grpo_gids == gid]
         assert (
             group_winners.sum().item() == 1
         ), f"Group {gid} has {group_winners.sum()} winners"
@@ -436,13 +513,11 @@ def main() -> None:
     print("  All assertions passed!")
 
     # Decode sample
-    print("\n  --- Sample decode (first test SFT record) ---")
-    ids = test_sft_ids[0]
-    mask = test_sft_mask[0]
-    # Find non-pad length
+    print("\n  --- Sample decode (first val SFT record) ---")
+    ids = val_sft_ids[0]
+    mask = val_sft_mask[0]
     non_pad = (ids != PAD_ID).sum().item()
     text = tokenizer.decode(ids[:non_pad].tolist())
-    # Find assistant region
     asst_start = 0
     for j in range(len(mask)):
         if mask[j] and not (j > 0 and mask[j - 1]):

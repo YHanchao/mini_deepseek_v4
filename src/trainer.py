@@ -15,7 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from config import MODEL_CONFIGS
 from src.deepseek import DeepSeekV4, DSArgs
-from src.dataset import PretrainDataset, SFTDataset
+from src.dataset import MixedSFTDataset, PretrainDataset, SFTDataset
 from src.loss import cross_entropy, indexer_kl_loss, cross_entropy_masked
 from src.optimizer import (
     Muon,
@@ -83,7 +83,29 @@ class SFTTrainerArgs(TrainerArgs):
     data_train: str = ""
     data_val: str = ""
 
-    # Use pretrain
+    # Data mixing: mix another SFT dataset into training at the given ratio
+    data_mix: str = ""
+    mix_ratio: float = 0.0
+
+    # Optimization
+    lr: float = 2.7e-4
+    lr_min: float = 2.7e-5
+    warmup_steps: int = 2000
+
+    # Data loading
+    num_workers: int = 0
+
+@dataclass
+class GRPOOffPolicyTrainerArgs(TrainerArgs):
+    # Model
+    config_name: str = "small"
+    base_model_path: str = ""
+
+    # Date
+    data_train: str = ""
+    data_val: str = ""
+
+    # Pretrain
     use_pretrain: bool = False
     pretrain_ratio: float = 0.05
 
@@ -91,6 +113,7 @@ class SFTTrainerArgs(TrainerArgs):
     lr: float = 2.7e-4
     lr_min: float = 2.7e-5
     warmup_steps: int = 2000
+    kl_penalty: float = 0.05
 
     # Data loading
     num_workers: int = 0
@@ -680,6 +703,25 @@ class SFTTrainer(Trainer):
         self._model_args: Optional[DSArgs] = None
         self.base_model_ckpt_path = args.base_model_path
 
+    def load_checkpoint(self, path: str) -> Tuple[int, Dict]:
+        """
+        SFT 中，我现在需要换一个数据集做SFT，但是沿用上一轮的Adam状态。所以此处step我要重置
+        """
+        state = torch.load(
+            path, map_location=f"cuda:{self.local_rank}", weights_only=False
+        )
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        model.load_state_dict(state["model_state_dict"])
+
+        for opt, sd in zip(self.optimizers, state["optimizers_state_dict"]):
+            opt.load_state_dict(sd)
+        torch.set_rng_state(state["torch_rng_state"].cpu())
+
+        if state.get("cuda_rng_state") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
+
+        return 0, {}
+
     def build_model_and_optimizers(self):
         cfg = MODEL_CONFIGS[self.config_name].copy()
         cfg["max_seq_len"] = self.max_seq_len
@@ -740,7 +782,10 @@ class SFTTrainer(Trainer):
         if not self.data_train:
             raise ValueError("--data-train is required")
 
-        train_dataset = SFTDataset(self.data_train)
+        if self.data_mix:
+            train_dataset = MixedSFTDataset(self.data_mix, self.data_train, self.mix_ratio)
+        else:
+            train_dataset = SFTDataset(self.data_train)
         train_sampler = None
         if self.world_size > 1:
             train_sampler = DistributedSampler(
@@ -918,3 +963,10 @@ class SFTTrainer(Trainer):
             opt.step()
         self.model.zero_grad()
         return gn
+
+
+class GRPOOffPolicyTrainer(Trainer):
+    def __init__(self, args: GRPOOffPolicyTrainerArgs):
+        super().__init__(args)
+        self._model_args: Optional[DSArgs] = None
+        self.base_model_ckpt_path = args.base_model_path

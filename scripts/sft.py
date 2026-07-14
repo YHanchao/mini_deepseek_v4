@@ -43,6 +43,8 @@ def get_args():
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--data-mix", type=str, default="")
+    p.add_argument("--mix-ratio", type=float, default=0.2)
     p.add_argument(
         "--base-model-path",
         type=str,

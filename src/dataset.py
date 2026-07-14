@@ -41,6 +41,54 @@ class SFTDataset(Dataset):
         return self.ids[idx][:-1], self.ids[idx][1:], self.mask[idx][:-1]
 
 
+class MixedSFTDataset(Dataset):
+    """Two SFT datasets mixed at a fixed ratio, with shuffled interleaving.
+
+    Samples are randomly shuffled at init time so that each contiguous slice
+    of indices contains a roughly proportional mix of both datasets.  This
+    avoids needing ``shuffle=True`` on ``DistributedSampler``, which can cause
+    device-generator mismatches in newer PyTorch versions.
+
+    Args:
+        path_a: minority dataset filepath (e.g., general SFT data).
+        path_b: majority dataset filepath (e.g., roast SFT data).
+        ratio_a: fraction of total data that comes from path_a (0.0 ~ 1.0).
+        seed: random seed for the index shuffle.
+    """
+
+    def __init__(self, path_a: str, path_b: str, ratio_a: float, seed: int = 42):
+        self.a = SFTDataset(path_a)
+        self.b = SFTDataset(path_b)
+        self._len = int(len(self.b) / (1 - ratio_a))
+        self._limit_a = self._len - len(self.b)
+        self.num_tokens = self.a.num_tokens + self.b.num_tokens  # ~ approximate
+
+        # Build and shuffle the per-index dataset routing
+        rng = np.random.RandomState(seed)
+        routing = np.empty(self._len, dtype=np.int32)
+        routing[: self._limit_a] = 0  # from dataset A (cycled)
+        routing[self._limit_a :] = 1  # from dataset B
+        rng.shuffle(routing)
+        self._routing = routing
+
+        # Per-dataset sample counter so we cycle each one independently
+        self._counters = np.zeros(2, dtype=np.int64)
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        which = int(self._routing[idx])
+        if which == 0:
+            src_idx = self._counters[0] % len(self.a)
+            self._counters[0] += 1
+            return self.a[src_idx]
+        else:
+            src_idx = self._counters[1] % len(self.b)
+            self._counters[1] += 1
+            return self.b[src_idx]
+
+
 class GRPOOffPolicyDataset(Dataset):
     """Off-policy GRPO dataset: pre-tokenized prompts + 4 candidates + editor scores.
 

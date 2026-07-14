@@ -40,8 +40,13 @@ def main():
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--repetition-penalty", type=float, default=1.1)
     parser.add_argument(
-        "--system-prompt", default="You are a helpful assistant.",
-        help="System prompt for chat mode"
+        "--system", "--system-prompt", dest="system_prompt",
+        default="You are a helpful assistant.",
+        help="System prompt for chat mode",
+    )
+    parser.add_argument(
+        "-n", "--num-samples", type=int, default=1,
+        help="Number of samples per prompt (non-interactive mode)",
     )
 
     # Modes
@@ -75,7 +80,13 @@ def main():
 
     # -- Single prompt
     if args.prompt:
-        print(engine.generate(args.prompt))
+        for i in range(args.num_samples):
+            result = engine.generate(args.prompt)
+            if args.num_samples > 1:
+                print(f"--- Sample {i + 1} ---")
+            print(result)
+            if args.num_samples > 1:
+                print()
 
     # -- Batch from file
     elif args.input:
@@ -86,49 +97,69 @@ def main():
             with open(args.input) as f:
                 conversations = json.load(f)
 
-            results = []
+            results = []   # list[list[str]] — one list of samples per conversation
             for conv in conversations:
                 messages = conv["messages"]
-                results.append(engine.chat(messages))
+                samples = [engine.chat(messages) for _ in range(args.num_samples)]
+                results.append(samples)
 
             if args.output:
                 with open(args.output, "w") as f:
-                    for conv, reply in zip(conversations, results):
-                        f.write(json.dumps({
-                            "messages": conv["messages"] + [
-                                {"role": "assistant", "content": reply}
+                    for conv, samples in zip(conversations, results):
+                        obj: dict = {"messages": conv["messages"]}
+                        if args.num_samples == 1:
+                            obj["messages"] = conv["messages"] + [
+                                {"role": "assistant", "content": samples[0]}
                             ]
-                        }, ensure_ascii=False) + "\n")
+                        else:
+                            obj["samples"] = samples
+                        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
                 print(f"Wrote {len(results)} results to {args.output}")
             else:
-                for conv, reply in zip(conversations, results):
-                    print("=" * 60)
+                for conv, samples in zip(conversations, results):
                     last_user = next(
                         (m["content"] for m in reversed(conv["messages"])
                          if m["role"] == "user"), ""
                     )
-                    print(f"User:    {last_user[:100]}")
-                    print(f"Assistant: {reply}")
-                    print("=" * 60)
+                    for si, reply in enumerate(samples):
+                        print("=" * 60)
+                        print(f"User:    {last_user[:100]}")
+                        if args.num_samples > 1:
+                            print(f"Sample {si + 1}/{args.num_samples}:")
+                        print(f"Assistant: {reply}")
+                        print("=" * 60)
         else:
             # Plain text prompts (one per line)
             with open(args.input) as f:
                 prompts = [line.rstrip("\n") for line in f if line.strip()]
-            results = engine.generate(prompts)
+
+            # True batch: each sample pass batches all prompts together
+            all_samples = [[] for _ in prompts]  # list[list[str]]
+            for si in range(args.num_samples):
+                batch_results = engine.generate(prompts)
+                for i, r in enumerate(batch_results):
+                    all_samples[i].append(r)
 
             if args.output:
                 with open(args.output, "w") as f:
-                    for p, r in zip(prompts, results):
+                    for p, samples in zip(prompts, all_samples):
                         f.write(f"Prompt:  {p}\n")
-                        f.write(f"Output:  {r}\n")
+                        for si, r in enumerate(samples):
+                            if args.num_samples > 1:
+                                f.write(f"--- Sample {si + 1} (temp={args.temperature}) ---\n")
+                            f.write(f"Output:  {r}\n")
                         f.write("-" * 60 + "\n")
-                print(f"Wrote {len(results)} results to {args.output}")
+                print(f"Wrote {len(all_samples)} prompts x {args.num_samples} samples "
+                      f"to {args.output}")
             else:
-                for p, r in zip(prompts, results):
-                    print("=" * 60)
-                    print(f"Prompt:  {p}")
-                    print(f"Output:  {r}")
-                    print("=" * 60)
+                for p, samples in zip(prompts, all_samples):
+                    for si, r in enumerate(samples):
+                        print("=" * 60)
+                        print(f"Prompt:  {p}")
+                        if args.num_samples > 1:
+                            print(f"Sample {si + 1}/{args.num_samples} (temp={args.temperature}):")
+                        print(f"Output:  {r}")
+                        print("=" * 60)
 
     # -- Interactive REPL
     elif args.interactive and args.chat:

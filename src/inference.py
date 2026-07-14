@@ -21,6 +21,11 @@ from src.tokenizer import BPETokenizer
 # ======================================================================
 
 
+def fast_multinomial(probs: torch.Tensor):
+    exp_gumble = torch.empty_like(probs).exponential_(1)
+    return (probs / exp_gumble).argmax(dim=-1, keepdim=True)
+
+
 @torch.no_grad()
 def sample_top_k(
     logits: torch.Tensor,
@@ -50,7 +55,7 @@ def sample_top_k(
     vals, _ = torch.topk(logits, k, dim=-1)
     logits[logits < vals[:, -1:]] = float("-inf")
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
+    return fast_multinomial(probs)
 
 
 @torch.no_grad()
@@ -290,11 +295,9 @@ class InferenceEngine:
     def generate(self, prompt: Union[str, List[str]]) -> Union[str, List[str]]:
         """Generate text from one or more prompts.
 
-        For a list of prompts, each prompt is generated sequentially
-        (the model's absolute position encoding and shared start_pos
-        make batched forward-passes with variable-length prompts
-        impractical without model changes).  KV cache is reset between
-        prompts.
+        Single prompts use the standard prefill+decode path.
+        Multiple prompts use true batched left-padded inference
+        (chunked by ``max_batch_len``).
 
         Args:
             prompt: A single prompt string or a list of prompt strings.
@@ -306,11 +309,18 @@ class InferenceEngine:
             self.reset_kv_cache()
             return self._generate_one(prompt)
         else:
-            results = []
+            # True batch inference
+            all_token_ids = []
+            common_eos = None
             for p in prompt:
-                self.reset_kv_cache()
-                results.append(self._generate_one(p))
-            return results
+                ids, eid = self.preprocess(p)
+                all_token_ids.append(ids)
+                if common_eos is None:
+                    common_eos = eid
+
+            self.reset_kv_cache()
+            all_results = self._generate_batch(all_token_ids, common_eos)
+            return [self.postprocess(ids) for ids in all_results]
 
     def _generate_one(self, prompt: str) -> str:
         """Generate for a single prompt (KV cache must be reset by caller)."""
@@ -318,9 +328,7 @@ class InferenceEngine:
         result_ids = self._generate_from_ids(token_ids, eos_id)
         return self.postprocess(result_ids)
 
-    def _generate_from_ids(
-        self, token_ids: list, eos_id: Optional[int]
-    ) -> list:
+    def _generate_from_ids(self, token_ids: list, eos_id: Optional[int]) -> list:
         """Raw generation from token IDs: prefill + autoregressive decode.
 
         Returns the full token-id list (prompt + generated tokens).
@@ -357,6 +365,96 @@ class InferenceEngine:
                 break
 
         return token_ids + generated
+
+    @torch.no_grad()
+    def _generate_batch(
+        self, all_token_ids: list[list], eos_id: Optional[int]
+    ) -> list[list]:
+        """True batched generation using the official DeepSeek approach.
+
+        Left-pads prompts with ``-1``, then runs a unified prefill+decode
+        loop.  A ``prompt_mask`` overrides model predictions with ground-truth
+        prompt tokens for positions that are still within a prompt, so
+        sequences with different lengths stay aligned.
+
+        Args:
+            all_token_ids: list of per-prompt token-id lists.
+            eos_id: EOS token id (or None).
+
+        Returns:
+            list of full token-id lists (prompt + generated), one per prompt.
+        """
+        batch_size = len(all_token_ids)
+        prompt_lens = [len(t) for t in all_token_ids]
+        max_len = max(prompt_lens)
+        min_len = min(prompt_lens)
+        max_batch = self._model_args.max_batch_len
+
+        if batch_size > max_batch:
+            # Recursively chunk — reset KV cache between chunks
+            results: list[list] = []
+            for i in range(0, batch_size, max_batch):
+                self.reset_kv_cache()
+                results.extend(
+                    self._generate_batch(all_token_ids[i : i + max_batch], eos_id)
+                )
+            return results
+
+        if min_len < self._min_prompt_tokens:
+            raise ValueError(
+                f"Prompt too short: {min_len} tokens < "
+                f"{self._min_prompt_tokens} (minimum for compress_ratio)."
+            )
+
+        total_len = min(
+            self._model_args.max_seq_len,
+            max_len + self.config.max_new_tokens,
+        )
+
+        # ---- left-padded token tensor + prompt mask ----
+        tokens = torch.full(
+            (batch_size, total_len), -1, dtype=torch.long, device=self.device
+        )
+        prompt_mask = torch.zeros(
+            (batch_size, total_len), dtype=torch.bool, device=self.device
+        )
+        for i, t in enumerate(all_token_ids):
+            tokens[i, : len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
+            prompt_mask[i, : len(t)] = True
+
+        # ---- unified prefill + decode loop ----
+        prev_pos = 0
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        for cur_pos in range(min_len, total_len):
+            ntp, _, _ = self.model(
+                tokens[:, prev_pos:cur_pos].contiguous(), start_pos=prev_pos
+            )
+            next_token = self.sample(ntp[:, -1, :]).squeeze(-1)  # (B,)
+
+            # Override with ground-truth for positions still within a prompt
+            next_token = torch.where(
+                prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            )
+            tokens[:, cur_pos] = next_token
+
+            if eos_id is not None:
+                finished |= (~prompt_mask[:, cur_pos]) & (next_token == eos_id)
+
+            prev_pos = cur_pos
+            if finished.all():
+                break
+
+        # ---- extract completions ----
+        results = []
+        for i in range(batch_size):
+            start = prompt_lens[i]
+            completion = tokens[i, start : start + self.config.max_new_tokens].tolist()
+            if eos_id is not None and eos_id in completion:
+                completion = completion[: completion.index(eos_id)]
+            results.append(all_token_ids[i] + completion)
+
+        return results
 
 
 # ======================================================================
@@ -490,7 +588,7 @@ class ChatEngine(InferenceEngine):
         idx = full_text.rfind(marker)
         if idx == -1:
             return full_text
-        text = full_text[idx + len(marker):]
+        text = full_text[idx + len(marker) :]
         eot = text.find(self._eot_tag)
         if eot != -1:
             text = text[:eot]
@@ -513,11 +611,20 @@ class ChatEngine(InferenceEngine):
             ]
             return self.chat(messages)
         else:
-            results = []
+            # True batch inference via parent's _generate_batch
+            all_token_ids = []
             for p in prompt:
                 messages = [
                     {"role": "system", "content": self.config.system_prompt},
                     {"role": "user", "content": p},
                 ]
-                results.append(self.chat(messages))
-            return results
+                formatted = self.format_conversation(messages)
+                ids = self.tokenizer.encode(formatted)
+                all_token_ids.append(ids)
+
+            eos_id = self.tokenizer._special_token_to_id.get(
+                self.config.eos_token.encode(), None
+            )
+            self.reset_kv_cache()
+            all_results = self._generate_batch(all_token_ids, eos_id)
+            return [self._extract_assistant_response(ids) for ids in all_results]

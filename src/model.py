@@ -29,7 +29,11 @@ class Embedding(nn.Module):
         self.weight = nn.Parameter(weight)
 
     def forward(self, token_ids: torch.Tensor):
-        return self.weight[token_ids]
+        mask = (token_ids < 0) | (token_ids >= self.weight.shape[0])
+        token_ids = token_ids.clamp(0, self.weight.shape[0] - 1)
+        y = self.weight[token_ids]
+        y[mask] = 0
+        return y
 
 
 class RMSNorm(nn.Module):
