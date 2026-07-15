@@ -34,6 +34,8 @@ def main():
     )
     parser.add_argument("-c", "--config", default="small", help="Model config name")
     parser.add_argument("-d", "--device", default="cuda:0", help="Device")
+    parser.add_argument("-b", "--max-batch-size", type=int, default=0,
+                        help="Override max batch size (0 = model default)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
@@ -66,6 +68,7 @@ def main():
         checkpoint_path=args.checkpoint,
         config_name=args.config,
         device=args.device,
+        max_batch_size=args.max_batch_size,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,

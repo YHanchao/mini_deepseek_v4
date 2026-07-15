@@ -108,3 +108,68 @@ def indexer_kl_loss(index_score, compress_topk_idxs, weight_compress):
         if valid.any()
         else torch.tensor(0.0, device=index_score.device)
     )
+
+
+def grpo_loss(
+    logits_working: torch.Tensor,
+    logits_ref: torch.Tensor,
+    token_ids: torch.Tensor,
+    scores: torch.Tensor,
+    masks: torch.Tensor,
+    eps: float = 0.2,
+    beta: float = 0.05,
+):
+    """GRPO loss with response-level importance ratio and token-level KL penalty.
+
+    Args:
+        logits_working: (bs, gs, seq_len, vocab) — policy model logits
+        logits_ref:     (bs, gs, seq_len, vocab) — reference model logits
+        token_ids:      (bs, gs, seq_len)        — ground-truth token ids
+        scores:         (bs, gs)                 — per-response reward scores
+        masks:          (bs, gs, seq_len)        — 1 on completion tokens, 0 elsewhere
+        eps:            PPO clip epsilon
+        beta:           KL penalty coefficient
+
+    Returns:
+        scalar loss = policy_loss + beta * kl_loss
+    """
+    # 1. Per-token log probs: (bs, gs, seq_len)
+    logp_w = (
+        torch.log_softmax(logits_working, dim=-1)
+        .gather(dim=-1, index=token_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    logp_r = (
+        torch.log_softmax(logits_ref, dim=-1)
+        .gather(dim=-1, index=token_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    # 2. Mask: only compute on completion (response) tokens
+    logp_w = logp_w * masks.float()
+    logp_r = logp_r * masks.float()
+
+    # 3. Response-level log probs: sum over token dimension → (bs, gs)
+    seq_logp_w = logp_w.sum(dim=-1)
+    seq_logp_r = logp_r.sum(dim=-1)
+
+    # 4. Response-level importance ratio: one scalar per response
+    log_ratio = seq_logp_w - seq_logp_r  # (bs, gs)
+    ratio = torch.exp(log_ratio)
+
+    # 5. Group-normalized advantage: (bs, gs)
+    adv = (scores - scores.mean(dim=-1, keepdim=True)) / (
+        scores.std(dim=-1, keepdim=True) + 1e-8
+    )
+
+    # 6. PPO-style clipped objective
+    ratio_clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
+    policy_gain = torch.min(ratio * adv, ratio_clipped * adv)  # (bs, gs)
+
+    # 7. Policy loss: maximize gain → minimize negative gain
+    policy_loss = -policy_gain.mean()
+
+    # 8. KL penalty: DeepSeek k3 estimator  r - log(r) - 1
+    kl_per_resp = ratio - log_ratio - 1  # (bs, gs)
+
+    return policy_loss + beta * kl_per_resp.mean()

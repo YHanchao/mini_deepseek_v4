@@ -90,40 +90,41 @@ class MixedSFTDataset(Dataset):
 
 
 class GRPOOffPolicyDataset(Dataset):
-    """Off-policy GRPO dataset: pre-tokenized prompts + 4 candidates + editor scores.
+    """Off-policy GRPO dataset: one group (prompt + 4 candidates + scores) per item.
 
-    Each original record is flattened into 4 rows (one per candidate response).
-    ``group_ids`` link the 4 candidates belonging to the same prompt so the
-    GRPO trainer can compute advantages within each group.
+    The underlying ``.pt`` file stores candidates flattened as (4N, seq_len)
+    rows.  At init time they are reshaped to (N, 4, seq_len) so each
+    ``__getitem__`` returns a complete group.
 
     Returns
-        inputs:       (1023,)  input_ids[:-1]
-        targets:      (1023,)  input_ids[1:]
-        comp_mask:    (1023,)  completion_mask[:-1] — True on candidate tokens
-        scores:       (5,)     5-dim editor scores
-        group_id:     scalar   which prompt this candidate belongs to
-        is_winner:    scalar   bool, whether this candidate is the editor's winner
+        input_ids:       (4, seq_len)  full pre-tokenized sequences
+        completion_mask: (4, seq_len)  True on candidate response tokens
+        scores:          (4, 5)        5-dim editor scores per candidate
+        is_winner:       (4,)          bool, which candidate was the winner
     """
 
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: str, group_size: int):
         data = torch.load(filepath)
-        self.ids = data["input_ids"]
-        self.mask = data["completion_mask"]
-        self.scores = data["scores"]
-        self.group_ids = data["group_ids"]
-        self.is_winner = data["is_winner"]
+        ids = data["input_ids"]  # (4N, seq_len)
+        mask = data["completion_mask"]  # (4N, seq_len)
+        scores = data["scores"]  # (4N, 5)
+        scores = torch.mean(scores, dim=-1)
+
+        n_groups = len(set(data["group_ids"].tolist()))
+        self._seq_len = ids.shape[1]
+
+        self.input_ids = ids.reshape(n_groups, group_size, self._seq_len)
+        self.completion_mask = mask.reshape(n_groups, group_size, self._seq_len)
+        self.scores = scores.reshape(n_groups, group_size)
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.input_ids)
 
     def __getitem__(self, idx):
         return (
-            self.ids[idx][:-1],
-            self.ids[idx][1:],
-            self.mask[idx][:-1],
-            self.scores[idx],
-            self.group_ids[idx],
-            self.is_winner[idx],
+            self.input_ids[idx],  # (4, seq_len)
+            self.completion_mask[idx],  # (4, seq_len)
+            self.scores[idx],  # (4,)
         )
 
 

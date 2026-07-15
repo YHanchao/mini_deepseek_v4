@@ -103,6 +103,7 @@ class InferenceConfig:
     checkpoint_path: str = ""
     config_name: str = "small"
     device: str = "cuda:0"
+    max_batch_size: int = 0  # 0 = use model default (max_batch_len)
 
     # Tokenizer
     tokenizer_vocab: str = "checkpoints/tokenizer_vocab.json"
@@ -188,6 +189,11 @@ class InferenceEngine:
             args.compress_ratios = args.compress_ratios + tuple(
                 [0] * (needed - len(args.compress_ratios))
             )
+
+        # Override batch size — only affects KV-cache buffer allocation
+        # (persistent=False, not saved in checkpoint), weights are unaffected.
+        if self.config.max_batch_size > 0:
+            args.max_batch_len = self.config.max_batch_size
 
         self._model_args = args
         # Minimum prompt length to avoid Indexer crash on short inputs
@@ -411,7 +417,8 @@ class InferenceEngine:
             max_len + self.config.max_new_tokens,
         )
 
-        # ---- left-padded token tensor + prompt mask ----
+        # ---- right-padded token tensor + prompt mask ----
+        # Real prompt tokens occupy [0, len(t)), PAD (-1) fills the tail.
         tokens = torch.full(
             (batch_size, total_len), -1, dtype=torch.long, device=self.device
         )
