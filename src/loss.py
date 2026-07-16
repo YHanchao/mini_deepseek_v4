@@ -119,7 +119,7 @@ def grpo_loss(
     eps: float = 0.2,
     beta: float = 0.05,
 ):
-    """GRPO loss with response-level importance ratio and token-level KL penalty.
+    """GRPO loss with token-level importance ratio.
 
     Args:
         logits_working: (bs, gs, seq_len, vocab) — policy model logits
@@ -145,31 +145,26 @@ def grpo_loss(
         .squeeze(-1)
     )
 
-    # 2. Mask: only compute on completion (response) tokens
-    logp_w = logp_w * masks.float()
-    logp_r = logp_r * masks.float()
-
-    # 3. Response-level log probs: sum over token dimension → (bs, gs)
-    seq_logp_w = logp_w.sum(dim=-1)
-    seq_logp_r = logp_r.sum(dim=-1)
-
-    # 4. Response-level importance ratio: one scalar per response
-    log_ratio = seq_logp_w - seq_logp_r  # (bs, gs)
+    # 2. Per-token log-ratio and ratio: (bs, gs, seq_len)
+    log_ratio = logp_w - logp_r
     ratio = torch.exp(log_ratio)
 
-    # 5. Group-normalized advantage: (bs, gs)
-    adv = (scores - scores.mean(dim=-1, keepdim=True)) / (
-        scores.std(dim=-1, keepdim=True) + 1e-8
-    )
+    # 3. Group-normalized advantage, broadcast to token dim: (bs, gs, 1)
+    adv = (
+        (scores - scores.mean(dim=-1, keepdim=True))
+        / (scores.std(dim=-1, keepdim=True) + 1e-8)
+    ).unsqueeze(-1)
 
-    # 6. PPO-style clipped objective
+    # 4. PPO-style clipped objective (per-token)
     ratio_clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
-    policy_gain = torch.min(ratio * adv, ratio_clipped * adv)  # (bs, gs)
+    gain = torch.min(ratio * adv, ratio_clipped * adv)  # (bs, gs, seq_len)
 
-    # 7. Policy loss: maximize gain → minimize negative gain
-    policy_loss = -policy_gain.mean()
+    # 5. Policy loss: average over masked tokens
+    valid = masks.float().sum().clamp(min=1)
+    policy_loss = -(gain * masks.float()).sum() / valid
 
-    # 8. KL penalty: DeepSeek k3 estimator  r - log(r) - 1
-    kl_per_resp = ratio - log_ratio - 1  # (bs, gs)
+    # 6. KL penalty: DeepSeek k3 estimator  r - log(r) - 1  (per-token, masked)
+    kl_per_tok = ratio - log_ratio - 1
+    kl_loss = (kl_per_tok * masks.float()).sum() / valid
 
-    return policy_loss + beta * kl_per_resp.mean()
+    return policy_loss + beta * kl_loss

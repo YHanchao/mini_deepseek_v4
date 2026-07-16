@@ -1028,12 +1028,9 @@ class GRPOOffPolicyTrainer(Trainer):
             self.model = DDP(
                 model, device_ids=[self.local_rank], find_unused_parameters=True
             )
-            self.ref_model = DDP(
-                ref_model, device_ids=[self.local_rank], find_unused_parameters=True
-            )
         else:
             self.model = model
-            self.ref_model = ref_model
+        self.ref_model = ref_model
 
         if self.is_main:
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -1120,11 +1117,10 @@ class GRPOOffPolicyTrainer(Trainer):
 
         input_ids = input_ids.to(self.local_rank, non_blocking=True)
 
-        ntp_working, mtp_list_working, idx_working = self.model(input_ids[..., :-1].contiguous())
+        ntp_working, _, _ = self.model(input_ids[..., :-1].contiguous())
         with torch.no_grad():
-            ntp_ref, mtp_list_ref, _ = self.ref_model(input_ids[..., :-1].contiguous())
+            ntp_ref, _, _ = self.ref_model(input_ids[..., :-1].contiguous())
 
-        # NTP RL
         ntp_working = ntp_working.reshape(bs, gs, -1, ntp_working.shape[-1])
         ntp_ref = ntp_ref.reshape(bs, gs, -1, ntp_ref.shape[-1])
         input_ids = input_ids.reshape(bs, gs, -1)  # (bs, gs, 1024)
@@ -1140,29 +1136,7 @@ class GRPOOffPolicyTrainer(Trainer):
             eps=self.clip_eps,
         )
 
-        # MTP RL
-        # 以 i = 0 为例，这里预期输入的长度是1022
-        mtp_loss = sum(
-            grpo_loss(
-                logits_working=mw[:, : -(1 + i)].reshape(bs, gs, -1, mw.shape[-1]),
-                logits_ref=mr[:, : -(1 + i)].reshape(bs, gs, -1, mr.shape[-1]),
-                token_ids=input_ids[..., 2 + i :],
-                scores=scores,
-                masks=masks[..., 2 + i :],
-                beta=self.kl_penalty,
-                eps=self.clip_eps,
-            )
-            for i, (mw, mr) in enumerate(zip(mtp_list_working, mtp_list_ref))
-        )
-
-        # KL 和之前一样，只算working model的
-        kl_loss = sum(
-            indexer_kl_loss(iscore, idx, wc.detach() if wc is not None else None)
-            for (iscore, wc, idx) in idx_working
-        )
-
-        lm_loss = ntp_loss + 0.3 * mtp_loss
-        total_loss = (lm_loss + 0.5 * kl_loss) / self.grad_accum
+        total_loss = ntp_loss / self.grad_accum
 
         if self.world_size > 1 and not is_last_micro:
             with self.model.no_sync():
@@ -1172,9 +1146,7 @@ class GRPOOffPolicyTrainer(Trainer):
 
         return {
             "ntp": ntp_loss.item(),
-            "mtp": mtp_loss.item(),
-            "kl": kl_loss.item(),
-            "lm": lm_loss.item(),
+            "lm": ntp_loss.item(),
         }
 
     @torch.no_grad()
@@ -1185,8 +1157,6 @@ class GRPOOffPolicyTrainer(Trainer):
         self.model.eval()
 
         total_ntp = 0.0
-        total_mtp = 0.0
-        total_kl = 0.0
         num_batches = 0
 
         for batch in self.val_loader:
@@ -1199,11 +1169,10 @@ class GRPOOffPolicyTrainer(Trainer):
 
             input_ids = input_ids.to(self.local_rank, non_blocking=True)
 
-            ntp_working, mtp_list_working, idx_working = self.model(input_ids[..., :-1].contiguous())
-            ntp_ref, mtp_list_ref, _ = self.ref_model(input_ids[..., :-1].contiguous())
+            ntp_working, _, _ = self.model(input_ids[..., :-1].contiguous())
+            ntp_ref, _, _ = self.ref_model(input_ids[..., :-1].contiguous())
 
-            # NTP RL
-            ntp_working = ntp_working.reshape(bs, gs, -1, ntp_working.shape[-1])  # (b, g, 1023)
+            ntp_working = ntp_working.reshape(bs, gs, -1, ntp_working.shape[-1])
             ntp_ref = ntp_ref.reshape(bs, gs, -1, ntp_ref.shape[-1])
             input_ids = input_ids.reshape(bs, gs, -1)
             masks = masks.to(self.local_rank, non_blocking=True)
@@ -1217,44 +1186,24 @@ class GRPOOffPolicyTrainer(Trainer):
                 beta=self.kl_penalty,
                 eps=self.clip_eps,
             ).item()
-            total_mtp += sum(
-                grpo_loss(
-                    logits_working=mw[:, : -(1 + i)].reshape(bs, gs, -1, mw.shape[-1]),
-                    logits_ref=mr[:, : -(1 + i)].reshape(bs, gs, -1, mr.shape[-1]),
-                    token_ids=input_ids[..., 2 + i :],
-                    scores=scores,
-                    masks=masks[..., 2 + i :],
-                    beta=self.kl_penalty,
-                    eps=self.clip_eps,
-                ).item()
-                for i, (mw, mr) in enumerate(zip(mtp_list_working, mtp_list_ref))
-            )
-            total_kl += sum(
-                indexer_kl_loss(iscore, idx, wc).item()
-                for (iscore, wc, idx) in idx_working
-            )
             num_batches += 1
 
         self.model.train()
 
         avg_ntp = total_ntp / num_batches
-        avg_mtp = total_mtp / num_batches
-        avg_kl = total_kl / num_batches
-        avg_lm = avg_ntp + 0.3 * avg_mtp
+        avg_lm = avg_ntp
 
         if self.world_size > 1:
             losses_t = torch.tensor(
-                [avg_ntp, avg_mtp, avg_kl, avg_lm],
+                [avg_ntp, avg_lm],
                 device=self.local_rank,
             )
             dist.all_reduce(losses_t, op=dist.ReduceOp.SUM)
             losses_t /= self.world_size
-            avg_ntp, avg_mtp, avg_kl, avg_lm = losses_t.tolist()
+            avg_ntp, avg_lm = losses_t.tolist()
 
         return {
             "val/ntp_loss": avg_ntp,
-            "val/mtp_loss": avg_mtp,
-            "val/kl_loss": avg_kl,
             "val/lm_loss": avg_lm,
         }
 
