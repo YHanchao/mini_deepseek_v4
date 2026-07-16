@@ -1126,7 +1126,7 @@ class GRPOOffPolicyTrainer(Trainer):
         input_ids = input_ids.reshape(bs, gs, -1)  # (bs, gs, 1024)
         masks = masks.to(self.local_rank, non_blocking=True)
         scores = scores.to(self.local_rank, non_blocking=True).reshape(bs, gs)
-        ntp_loss = grpo_loss(
+        metrics = grpo_loss(
             logits_working=ntp_working,
             logits_ref=ntp_ref,
             token_ids=input_ids[..., 1:],
@@ -1136,7 +1136,17 @@ class GRPOOffPolicyTrainer(Trainer):
             eps=self.clip_eps,
         )
 
-        total_loss = ntp_loss / self.grad_accum
+        # ---- additional monitoring ----
+        log_probs = torch.log_softmax(ntp_working, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy_per_tok = -(probs * log_probs).sum(dim=-1)
+        mask_f = masks[..., :-1].float()
+        entropy = (entropy_per_tok * mask_f).sum() / mask_f.sum().clamp(min=1)
+
+        reward_margin = (scores.max(dim=-1).values - scores.min(dim=-1).values).mean()
+        adv = metrics["advantage"]
+
+        total_loss = metrics["total_loss"] / self.grad_accum
 
         if self.world_size > 1 and not is_last_micro:
             with self.model.no_sync():
@@ -1145,8 +1155,18 @@ class GRPOOffPolicyTrainer(Trainer):
             total_loss.backward()
 
         return {
-            "ntp": ntp_loss.item(),
-            "lm": ntp_loss.item(),
+            "ntp": metrics["total_loss"].item(),
+            "lm": metrics["total_loss"].item(),
+            "policy_loss": metrics["policy_loss"].item(),
+            "kl": metrics["kl"].item(),
+            "ratio_mean": metrics["ratio_mean"].item(),
+            "ratio_std": metrics["ratio_std"].item(),
+            "ratio_max": metrics["ratio_max"].item(),
+            "clip_frac": metrics["clip_fraction"].item(),
+            "entropy": entropy.item(),
+            "reward_margin": reward_margin.item(),
+            "adv_mean": adv.mean().item(),
+            "adv_std": adv.std().item(),
         }
 
     @torch.no_grad()
@@ -1156,7 +1176,7 @@ class GRPOOffPolicyTrainer(Trainer):
 
         self.model.eval()
 
-        total_ntp = 0.0
+        accum: Dict[str, float] = {}
         num_batches = 0
 
         for batch in self.val_loader:
@@ -1177,7 +1197,7 @@ class GRPOOffPolicyTrainer(Trainer):
             input_ids = input_ids.reshape(bs, gs, -1)
             masks = masks.to(self.local_rank, non_blocking=True)
             scores = scores.to(self.local_rank, non_blocking=True).reshape(bs, gs)
-            total_ntp += grpo_loss(
+            metrics = grpo_loss(
                 logits_working=ntp_working,
                 logits_ref=ntp_ref,
                 token_ids=input_ids[..., 1:],
@@ -1185,27 +1205,76 @@ class GRPOOffPolicyTrainer(Trainer):
                 masks=masks[..., :-1],
                 beta=self.kl_penalty,
                 eps=self.clip_eps,
-            ).item()
+            )
+
+            mask_f = masks[..., :-1].float()
+            response_logp = (metrics["logp_w"] * mask_f).sum(dim=-1)  # (bs, gs)
+            response_len = mask_f.sum(dim=-1).clamp(min=1)
+            response_score = response_logp / response_len  # length-normalized
+
+            # ranking metrics
+            pred = response_score.argmax(dim=-1)  # (bs,)
+            gt = scores.argmax(dim=-1)  # (bs,)
+            top1 = (pred == gt).float().mean()
+
+            score_diff = scores.unsqueeze(-1) - scores.unsqueeze(-2)  # (bs, gs, gs)
+            model_diff = response_score.unsqueeze(-1) - response_score.unsqueeze(-2)
+            pair_mask = score_diff > 0
+            pair_correct = ((model_diff > 0) & pair_mask).float().sum(dim=(-1, -2))
+            pair_total = pair_mask.float().sum(dim=(-1, -2))
+            pairwise_acc = (pair_correct / pair_total.clamp(min=1)).mean()
+
+            def _spearman(x, y):
+                rk = lambda t: t.argsort(dim=-1).argsort(dim=-1).float()
+                xr, yr = rk(x), rk(y)
+                mx, my = xr.mean(dim=-1, keepdim=True), yr.mean(dim=-1, keepdim=True)
+                num = ((xr - mx) * (yr - my)).sum(dim=-1)
+                den = ((xr - mx) ** 2).sum(dim=-1).sqrt() * ((yr - my) ** 2).sum(dim=-1).sqrt() + 1e-8
+                return (num / den).mean()
+            spearman = _spearman(response_score, scores)
+
+            rw_score = (response_score * scores).mean()
+
+            for k in ["total_loss", "policy_loss", "kl", "ratio_mean", "ratio_std",
+                       "ratio_max", "clip_fraction"]:
+                accum[k] = accum.get(k, 0.0) + metrics[k].item()
+            accum["response_logp"] = accum.get("response_logp", 0.0) + response_logp.mean().item()
+            accum["top1"] = accum.get("top1", 0.0) + top1.item()
+            accum["pairwise"] = accum.get("pairwise", 0.0) + pairwise_acc.item()
+            accum["spearman"] = accum.get("spearman", 0.0) + spearman.item()
+            accum["rw_score"] = accum.get("rw_score", 0.0) + rw_score.item()
             num_batches += 1
 
         self.model.train()
 
-        avg_ntp = total_ntp / num_batches
-        avg_lm = avg_ntp
+        for k in accum:
+            accum[k] /= num_batches
 
         if self.world_size > 1:
-            losses_t = torch.tensor(
-                [avg_ntp, avg_lm],
-                device=self.local_rank,
-            )
-            dist.all_reduce(losses_t, op=dist.ReduceOp.SUM)
-            losses_t /= self.world_size
-            avg_ntp, avg_lm = losses_t.tolist()
+            keys = sorted(accum.keys())
+            vals = [accum[k] for k in keys]
+            t = torch.tensor(vals, device=self.local_rank)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t /= self.world_size
+            for k, v in zip(keys, t.tolist()):
+                accum[k] = v
 
-        return {
-            "val/ntp_loss": avg_ntp,
-            "val/lm_loss": avg_lm,
-        }
+        result = {f"val/{k}": v for k, v in accum.items()}
+        result["val/lm_loss"] = accum.get("total_loss", 0)
+        result["val/ntp_loss"] = accum.get("total_loss", 0)
+        result["val/kl_loss"] = accum.get("kl", 0)
+
+        self._log(
+            f"  VAL: top1={accum.get('top1', 0):.3f} "
+            f"pairwise={accum.get('pairwise', 0):.3f} "
+            f"spearman={accum.get('spearman', 0):.3f} | "
+            f"rw_score={accum.get('rw_score', 0):.4f} "
+            f"resp_logp={accum.get('response_logp', 0):.2f} | "
+            f"kl={accum.get('kl', 0):.4f} "
+            f"ratio(mean/max)={accum.get('ratio_mean', 0):.3f}/{accum.get('ratio_max', 0):.2f} "
+            f"clip={accum.get('clip_fraction', 0):.3f}"
+        )
+        return result
 
     # ------------------------------------------------------------------
     # LR schedule

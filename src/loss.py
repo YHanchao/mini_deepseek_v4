@@ -119,7 +119,7 @@ def grpo_loss(
     eps: float = 0.2,
     beta: float = 0.05,
 ):
-    """GRPO loss with token-level importance ratio.
+    """GRPO loss with token-level importance ratio and monitoring metrics.
 
     Args:
         logits_working: (bs, gs, seq_len, vocab) — policy model logits
@@ -131,7 +131,8 @@ def grpo_loss(
         beta:           KL penalty coefficient
 
     Returns:
-        scalar loss = policy_loss + beta * kl_loss
+        dict with keys: total_loss, policy_loss, kl, ratio_mean, ratio_std,
+                        ratio_max, clip_fraction, advantage
     """
     # 1. Per-token log probs: (bs, gs, seq_len)
     logp_w = (
@@ -149,22 +150,44 @@ def grpo_loss(
     log_ratio = logp_w - logp_r
     ratio = torch.exp(log_ratio)
 
-    # 3. Group-normalized advantage, broadcast to token dim: (bs, gs, 1)
-    adv = (
-        (scores - scores.mean(dim=-1, keepdim=True))
-        / (scores.std(dim=-1, keepdim=True) + 1e-8)
-    ).unsqueeze(-1)
+    # 3. Group-normalized advantage: (bs, gs, 1)
+    adv_2d = (scores - scores.mean(dim=-1, keepdim=True)) / (
+        scores.std(dim=-1, keepdim=True) + 1e-8
+    )
+    adv = adv_2d.unsqueeze(-1)
 
     # 4. PPO-style clipped objective (per-token)
     ratio_clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
-    gain = torch.min(ratio * adv, ratio_clipped * adv)  # (bs, gs, seq_len)
+    gain = torch.min(ratio * adv, ratio_clipped * adv)
 
     # 5. Policy loss: average over masked tokens
-    valid = masks.float().sum().clamp(min=1)
-    policy_loss = -(gain * masks.float()).sum() / valid
+    mask_f = masks.float()
+    valid = mask_f.sum().clamp(min=1)
+    policy_loss = -(gain * mask_f).sum() / valid
 
-    # 6. KL penalty: DeepSeek k3 estimator  r - log(r) - 1  (per-token, masked)
+    # 6. KL penalty (per-token, masked)
     kl_per_tok = ratio - log_ratio - 1
-    kl_loss = (kl_per_tok * masks.float()).sum() / valid
+    kl = (kl_per_tok * mask_f).sum() / valid
 
-    return policy_loss + beta * kl_loss
+    # 7. Monitoring: ratio statistics over valid tokens
+    ratio_valid = ratio[masks.bool()]
+    ratio_mean = ratio_valid.mean()
+    ratio_std = ratio_valid.std()
+    ratio_max = ratio_valid.max()
+
+    # 8. Monitoring: PPO clip fraction
+    clip_mask = (ratio > 1 + eps) | (ratio < 1 - eps)
+    clip_fraction = (clip_mask.float() * mask_f).sum() / valid
+
+    return {
+        "total_loss": policy_loss + beta * kl,
+        "policy_loss": policy_loss,
+        "kl": kl,
+        "ratio_mean": ratio_mean,
+        "ratio_std": ratio_std,
+        "ratio_max": ratio_max,
+        "clip_fraction": clip_fraction,
+        "advantage": adv_2d,
+        "logp_w": logp_w,
+        "logp_r": logp_r,
+    }
