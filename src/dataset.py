@@ -128,21 +128,4 @@ class GRPOOffPolicyDataset(Dataset):
         )
 
 
-class GRPOOnPolicyDataset(Dataset):
-    """On-policy GRPO dataset: pre-tokenized prompts only (no responses).
-
-    Returns
-        input_ids:   (1024,)  full padded prompt ending with ``<|assistant|>\\n``
-        prompt_mask: (1024,)  True on non-padding tokens
-    """
-
-    def __init__(self, filepath: str):
-        data = torch.load(filepath)
-        self.ids = data["input_ids"]
-        self.prompt_mask = data["prompt_mask"]
-
-    def __len__(self):
-        return len(self.ids)
-
-    def __getitem__(self, idx):
-        return self.ids[idx], self.prompt_mask[idx]
+DPODataset = GRPOOffPolicyDataset

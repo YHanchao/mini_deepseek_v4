@@ -20,8 +20,15 @@ from src.dataset import (
     PretrainDataset,
     SFTDataset,
     GRPOOffPolicyDataset,
+    DPODataset,
 )
-from src.loss import cross_entropy, indexer_kl_loss, cross_entropy_masked, grpo_loss
+from src.loss import (
+    cross_entropy,
+    indexer_kl_loss,
+    cross_entropy_masked,
+    grpo_loss,
+    dpo_loss,
+)
 from src.optimizer import (
     Muon,
     AdamW,
@@ -120,6 +127,29 @@ class GRPOOffPolicyTrainerArgs(TrainerArgs):
     warmup_steps: int = 2000
     kl_penalty: float = 0.05
     clip_eps: float = 0.2
+
+    # Data loading
+    num_workers: int = 0
+
+
+@dataclass
+class DPOTrainerArgs(TrainerArgs):
+    # Model
+    config_name: str = "small"
+    base_model_path: str = ""
+    ref_model_ckpt_path: str = ""
+
+    # Data
+    data_train: str = ""
+    data_val: str = ""
+    group_size: int = 4
+    batch_size: int = 1
+
+    # Optimization
+    lr: float = 2.7e-4
+    lr_min: float = 2.7e-5
+    warmup_steps: int = 2000
+    beta: float = 0.1
 
     # Data loading
     num_workers: int = 0
@@ -1102,8 +1132,7 @@ class GRPOOffPolicyTrainer(Trainer):
             )
             if self.val_loader:
                 self._log(
-                    f"Val data: {self.data_val} | "
-                    f"{len(val_dataset):,} samples"
+                    f"Val data: {self.data_val} | " f"{len(val_dataset):,} samples"
                 )
 
     def train_step(self, batch, is_last_micro):
@@ -1229,16 +1258,28 @@ class GRPOOffPolicyTrainer(Trainer):
                 xr, yr = rk(x), rk(y)
                 mx, my = xr.mean(dim=-1, keepdim=True), yr.mean(dim=-1, keepdim=True)
                 num = ((xr - mx) * (yr - my)).sum(dim=-1)
-                den = ((xr - mx) ** 2).sum(dim=-1).sqrt() * ((yr - my) ** 2).sum(dim=-1).sqrt() + 1e-8
+                den = ((xr - mx) ** 2).sum(dim=-1).sqrt() * ((yr - my) ** 2).sum(
+                    dim=-1
+                ).sqrt() + 1e-8
                 return (num / den).mean()
+
             spearman = _spearman(response_score, scores)
 
             rw_score = (response_score * scores).mean()
 
-            for k in ["total_loss", "policy_loss", "kl", "ratio_mean", "ratio_std",
-                       "ratio_max", "clip_fraction"]:
+            for k in [
+                "total_loss",
+                "policy_loss",
+                "kl",
+                "ratio_mean",
+                "ratio_std",
+                "ratio_max",
+                "clip_fraction",
+            ]:
                 accum[k] = accum.get(k, 0.0) + metrics[k].item()
-            accum["response_logp"] = accum.get("response_logp", 0.0) + response_logp.mean().item()
+            accum["response_logp"] = (
+                accum.get("response_logp", 0.0) + response_logp.mean().item()
+            )
             accum["top1"] = accum.get("top1", 0.0) + top1.item()
             accum["pairwise"] = accum.get("pairwise", 0.0) + pairwise_acc.item()
             accum["spearman"] = accum.get("spearman", 0.0) + spearman.item()
@@ -1273,6 +1314,317 @@ class GRPOOffPolicyTrainer(Trainer):
             f"kl={accum.get('kl', 0):.4f} "
             f"ratio(mean/max)={accum.get('ratio_mean', 0):.3f}/{accum.get('ratio_max', 0):.2f} "
             f"clip={accum.get('clip_fraction', 0):.3f}"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # LR schedule
+    # ------------------------------------------------------------------
+
+    def get_lr(self, step: int) -> float:
+        return cosine_annealing_lr_schedule(
+            step, self.lr, self.lr_min, self.warmup_steps, self.total_steps
+        )
+
+    # ------------------------------------------------------------------
+    # Optimizer step
+    # ------------------------------------------------------------------
+
+    def _optimizer_step(self) -> float:
+        gn = grad_clip(self.model.parameters(), self.max_grad_norm)
+        for opt in self.optimizers:
+            opt.step()
+        self.model.zero_grad()
+        return gn
+
+
+class DPOTrainer(Trainer):
+    def __init__(self, args: DPOTrainerArgs):
+        super().__init__(args)
+        self._model_args: Optional[DSArgs] = None
+        self.base_model_ckpt_path = args.base_model_path
+        self.ref_model_ckpt_path = args.ref_model_ckpt_path
+        self.group_size = args.group_size
+
+    def build_model_and_optimizers(self):
+        cfg = MODEL_CONFIGS[self.config_name].copy()
+        cfg["max_seq_len"] = self.max_seq_len
+        self.max_seq_len = cfg["max_seq_len"]
+
+        base_fields = DSArgs.__dataclass_fields__
+        args = DSArgs(**{k: v for k, v in cfg.items() if k in base_fields})
+
+        needed = args.n_layer + args.n_mtp_layer
+        if len(args.compress_ratios) < needed:
+            args.compress_ratios = args.compress_ratios + tuple(
+                [0] * (needed - len(args.compress_ratios))
+            )  # MTP layer当时没有写compress_ratios，当时只写了前面block的，打个补丁
+
+        self._model_args = args
+
+        model = DeepSeekV4(args)
+        model.train()
+        model = model.to(self.local_rank)
+
+        ref_model = DeepSeekV4(args)
+        ref_model = ref_model.to(self.local_rank)
+
+        # 和pretrain相比只多出来加载权重
+        ckpt = torch.load(
+            self.base_model_ckpt_path,
+            map_location=f"cuda:{self.local_rank}",
+            weights_only=False,
+        )
+        model.load_state_dict(ckpt["model_state_dict"])
+        ref_model.load_state_dict(ckpt["model_state_dict"])
+        ref_model.eval()
+        ref_model.requires_grad_(False)
+
+        muon_p, adamw_p = group_params(model)
+        idx_p = get_indexer_params(model)
+
+        muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
+        adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+        idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+
+        self.optimizers = [muon_opt, adamw_opt, idx_opt]
+
+        if self.world_size > 1:
+            self.model = DDP(
+                model, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+        else:
+            self.model = model
+        self.ref_model = ref_model
+
+        if self.is_main:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            self._log(
+                f"Model: {self.config_name} | "
+                f"Params: {total_params/1e6:.1f}M total, {trainable/1e6:.1f}M trainable | "
+                f"d_model={args.d_model}, n_layer={args.n_layer}, "
+                f"n_experts={args.n_experts}, seq_len={args.max_seq_len}"
+            )
+
+    def build_dataloaders(self):
+        if not self.data_train:
+            raise ValueError("--data-train is required")
+
+        train_dataset = DPODataset(self.data_train, group_size=self.group_size)
+        train_sampler = None
+        if self.world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False,
+            )
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        if self.data_val:
+            val_dataset = DPODataset(self.data_val, group_size=self.group_size)
+            val_sampler = None
+            if self.world_size > 1:
+                val_sampler = DistributedSampler(
+                    val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=False,
+                )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+        else:
+            self.val_loader = None
+
+        if self.is_main:
+            self._log(
+                f"Train data: {self.data_train} | "
+                f"{len(train_dataset):,} samples | "
+                f"batch={self.batch_size}, group_size={self.group_size}, "
+                f"seq_len={self.max_seq_len}"
+            )
+            if self.val_loader:
+                self._log(
+                    f"Val data: {self.data_val} | " f"{len(val_dataset):,} samples"
+                )
+
+    def train_step(self, batch, is_last_micro):
+        # input_ids: (batch_size, group_size, seq_len)
+        # 和SFT & Pretrain的数据格式不同，前面两个直接返回了input_ids 和 target ids
+        # 其长度都是1023
+        # 这里input_ids就是1024，所以要按需取用
+        input_ids, masks, scores = batch
+        bs, gs, _ = input_ids.shape
+        input_ids = input_ids.reshape(bs * gs, -1)
+
+        input_ids = input_ids.to(self.local_rank, non_blocking=True)
+
+        ntp_working, _, _ = self.model(input_ids[..., :-1].contiguous())
+        with torch.no_grad():
+            ntp_ref, _, _ = self.ref_model(input_ids[..., :-1].contiguous())
+
+        ntp_working = ntp_working.reshape(bs, gs, -1, ntp_working.shape[-1])
+        ntp_ref = ntp_ref.reshape(bs, gs, -1, ntp_ref.shape[-1])
+        input_ids = input_ids.reshape(bs, gs, -1)  # (bs, gs, 1024)
+        masks = masks.to(self.local_rank, non_blocking=True)
+        scores = scores.to(self.local_rank, non_blocking=True).reshape(bs, gs)
+        metrics = dpo_loss(
+            logits_working=ntp_working,
+            logits_ref=ntp_ref,
+            token_ids=input_ids[..., 1:],
+            scores=scores,
+            masks=masks[..., :-1],
+            beta=self.beta,
+        )
+
+        # ---- additional monitoring ----
+        reward_margin = (scores.max(dim=-1).values - scores.min(dim=-1).values).mean()
+
+        total_loss = metrics["total_loss"] / self.grad_accum
+
+        if self.world_size > 1 and not is_last_micro:
+            with self.model.no_sync():
+                total_loss.backward()
+        else:
+            total_loss.backward()
+
+        return {
+            "ntp": metrics["total_loss"].item(),
+            "lm": metrics["total_loss"].item(),
+            "dpo_acc": metrics["accuracy"].item(),
+            "log_ratio_mean": metrics["log_ratio_mean"].item(),
+            "log_ratio_std": metrics["log_ratio_std"].item(),
+            "log_ratio_diff": metrics["log_ratio_diff_mean"].item(),
+            "reward_margin": reward_margin.item(),
+        }
+
+    @torch.no_grad()
+    def validate(self, max_val_batches: int = 100) -> Dict[str, float]:
+        if not self.val_loader:
+            return {}
+
+        self.model.eval()
+
+        accum: Dict[str, float] = {}
+        num_batches = 0
+
+        for batch in self.val_loader:
+            if num_batches >= max_val_batches:
+                break
+
+            input_ids, masks, scores = batch
+            bs, gs, _ = input_ids.shape
+            input_ids = input_ids.reshape(bs * gs, -1)
+
+            input_ids = input_ids.to(self.local_rank, non_blocking=True)
+
+            ntp_working, _, _ = self.model(input_ids[..., :-1].contiguous())
+            ntp_ref, _, _ = self.ref_model(input_ids[..., :-1].contiguous())
+
+            ntp_working = ntp_working.reshape(bs, gs, -1, ntp_working.shape[-1])
+            ntp_ref = ntp_ref.reshape(bs, gs, -1, ntp_ref.shape[-1])
+            input_ids = input_ids.reshape(bs, gs, -1)
+            masks = masks.to(self.local_rank, non_blocking=True)
+            scores = scores.to(self.local_rank, non_blocking=True).reshape(bs, gs)
+            metrics = dpo_loss(
+                logits_working=ntp_working,
+                logits_ref=ntp_ref,
+                token_ids=input_ids[..., 1:],
+                scores=scores,
+                masks=masks[..., :-1],
+                beta=self.beta,
+            )
+
+            mask_f = masks[..., :-1].float()
+            response_logp = (metrics["logp_w"] * mask_f).sum(dim=-1)  # (bs, gs)
+            response_len = mask_f.sum(dim=-1).clamp(min=1)
+            response_score = response_logp / response_len  # length-normalized
+
+            # ranking metrics
+            pred = response_score.argmax(dim=-1)  # (bs,)
+            gt = scores.argmax(dim=-1)  # (bs,)
+            top1 = (pred == gt).float().mean()
+
+            score_diff = scores.unsqueeze(-1) - scores.unsqueeze(-2)  # (bs, gs, gs)
+            model_diff = response_score.unsqueeze(-1) - response_score.unsqueeze(-2)
+            pair_mask = score_diff > 0
+            pair_correct = ((model_diff > 0) & pair_mask).float().sum(dim=(-1, -2))
+            pair_total = pair_mask.float().sum(dim=(-1, -2))
+            pairwise_acc = (pair_correct / pair_total.clamp(min=1)).mean()
+
+            def _spearman(x, y):
+                rk = lambda t: t.argsort(dim=-1).argsort(dim=-1).float()
+                xr, yr = rk(x), rk(y)
+                mx, my = xr.mean(dim=-1, keepdim=True), yr.mean(dim=-1, keepdim=True)
+                num = ((xr - mx) * (yr - my)).sum(dim=-1)
+                den = ((xr - mx) ** 2).sum(dim=-1).sqrt() * ((yr - my) ** 2).sum(
+                    dim=-1
+                ).sqrt() + 1e-8
+                return (num / den).mean()
+
+            spearman = _spearman(response_score, scores)
+
+            for k in [
+                "total_loss",
+                "accuracy",
+                "log_ratio_mean",
+                "log_ratio_std",
+                "log_ratio_diff_mean",
+            ]:
+                accum[k] = accum.get(k, 0.0) + metrics[k].item()
+            accum["response_logp"] = (
+                accum.get("response_logp", 0.0) + response_score.mean().item()
+            )
+            accum["top1"] = accum.get("top1", 0.0) + top1.item()
+            accum["pairwise"] = accum.get("pairwise", 0.0) + pairwise_acc.item()
+            accum["spearman"] = accum.get("spearman", 0.0) + spearman.item()
+            num_batches += 1
+
+        self.model.train()
+
+        for k in accum:
+            accum[k] /= num_batches
+
+        if self.world_size > 1:
+            keys = sorted(accum.keys())
+            vals = [accum[k] for k in keys]
+            t = torch.tensor(vals, device=self.local_rank)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t /= self.world_size
+            for k, v in zip(keys, t.tolist()):
+                accum[k] = v
+
+        result = {f"val/{k}": v for k, v in accum.items()}
+        result["val/lm_loss"] = accum.get("total_loss", 0)
+        result["val/ntp_loss"] = accum.get("total_loss", 0)
+        result["val/kl_loss"] = 0.0
+
+        self._log(
+            f"  VAL: top1={accum.get('top1', 0):.3f} "
+            f"pairwise={accum.get('pairwise', 0):.3f} "
+            f"spearman={accum.get('spearman', 0):.3f} | "
+            f"dpo_acc={accum.get('accuracy', 0):.3f} "
+            f"resp_score={accum.get('response_logp', 0):.2f} | "
+            f"total_loss={accum.get('total_loss', 0):.4f} "
+            f"diff={accum.get('log_ratio_diff_mean', 0):.4f}"
         )
         return result
 

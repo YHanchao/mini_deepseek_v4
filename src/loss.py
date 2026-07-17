@@ -191,3 +191,90 @@ def grpo_loss(
         "logp_w": logp_w,
         "logp_r": logp_r,
     }
+
+
+def dpo_loss(
+    logits_working: torch.Tensor,
+    logits_ref: torch.Tensor,
+    token_ids: torch.Tensor,
+    scores: torch.Tensor,
+    masks: torch.Tensor,
+    beta: float = 0.1,
+):
+    """DPO loss with Bradley-Terry model over all pairs within each group.
+
+    For each group of 4 responses, constructs all C(4,2)=6 pairs. Each pair where
+    scores differ contributes a binary cross-entropy loss that pushes the model to
+    increase log-ratio for the chosen response relative to the rejected one.
+
+    Args:
+        logits_working: (bs, gs, seq_len, vocab) — policy model logits
+        logits_ref:     (bs, gs, seq_len, vocab) — reference model logits
+        token_ids:      (bs, gs, seq_len)        — ground-truth token ids
+        scores:         (bs, gs)                 — per-response scalar rewards
+        masks:          (bs, gs, seq_len)        — 1 on response tokens, 0 elsewhere
+        beta:           temperature for the Bradley-Terry implicit reward
+
+    Returns:
+        dict with keys: total_loss, accuracy, log_ratio_mean, log_ratio_std,
+                        log_ratio_diff_mean, num_pairs
+    """
+    # 1. Per-token log probs: (bs, gs, seq_len)
+    logp_w = (
+        torch.log_softmax(logits_working, dim=-1)
+        .gather(dim=-1, index=token_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    with torch.no_grad():
+        logp_r = (
+            torch.log_softmax(logits_ref, dim=-1)
+            .gather(dim=-1, index=token_ids.unsqueeze(-1))
+            .squeeze(-1)
+        )
+
+    # 2. Sequence-level mean log-ratio: (bs, gs)
+    resp_len = masks.sum(dim=-1).clamp(min=1)
+    log_ratio = ((logp_w - logp_r) * masks).sum(dim=-1) / resp_len
+
+    # 3. Build all C(gs,2) pairs
+    gs = scores.shape[1]
+    idx_i, idx_j = torch.triu_indices(gs, gs, offset=1, device=scores.device).unbind()
+
+    score_i = scores[:, idx_i]  # (bs, 6)
+    score_j = scores[:, idx_j]  # (bs, 6)
+
+    log_ratio_i = log_ratio[:, idx_i]  # (bs, 6)
+    log_ratio_j = log_ratio[:, idx_j]  # (bs, 6)
+
+    # chosen = higher score, rejected = lower score
+    pref_mask = score_i > score_j
+    tie_mask = score_i == score_j
+
+    chosen_lr = torch.where(pref_mask, log_ratio_i, log_ratio_j)
+    rejected_lr = torch.where(pref_mask, log_ratio_j, log_ratio_i)
+
+    # 4. DPO loss: -log(sigmoid(beta * (chosen - rejected)))
+    diff = beta * (chosen_lr - rejected_lr)
+    pair_loss = -torch.nn.functional.logsigmoid(diff)
+
+    valid = ~tie_mask
+    valid_count = valid.sum().clamp(min=1)
+    total_loss = (pair_loss * valid).sum() / valid_count
+
+    # 5. Accuracy: fraction of valid pairs correctly ordered
+    correct = (diff > 0) & valid
+    accuracy = correct.float().sum() / valid_count
+
+    return {
+        "total_loss": total_loss,
+        "accuracy": accuracy,
+        "log_ratio_mean": log_ratio.mean(),
+        "log_ratio_std": log_ratio.std(),
+        "log_ratio_diff_mean": (
+            diff[valid].mean()
+            if valid.any()
+            else torch.tensor(0.0, device=scores.device)
+        ),
+        "logp_w": logp_w,
+        "logp_r": logp_r,
+    }
