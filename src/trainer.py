@@ -21,6 +21,7 @@ from src.dataset import (
     SFTDataset,
     GRPOOffPolicyDataset,
     DPODataset,
+    SimPODataset,
 )
 from src.loss import (
     cross_entropy,
@@ -28,6 +29,7 @@ from src.loss import (
     cross_entropy_masked,
     grpo_loss,
     dpo_loss,
+    simpo_loss,
 )
 from src.optimizer import (
     Muon,
@@ -152,6 +154,25 @@ class DPOTrainerArgs(TrainerArgs):
     beta: float = 0.1
 
     # Data loading
+    num_workers: int = 0
+
+
+@dataclass
+class SimPOTrainerArgs(TrainerArgs):
+    config_name: str = "small"
+    base_model_path: str = ""
+
+    data_train: str = ""
+    data_val: str = ""
+
+    lr: float = 2.7e-4
+    lr_min: float = 2.7e-5
+    warmup_steps: int = 2000
+
+    beta: float = 1.0
+    gamma: float = 0.1
+    lambda_simpo: float = 1.0
+
     num_workers: int = 0
 
 
@@ -284,12 +305,12 @@ class Trainer:
         tok_per_sec = tokens_this_step / step_time if step_time > 0 else 0
         mem_mb = torch.cuda.max_memory_allocated(self.local_rank) / 1024**2
 
+        metrics_str = " | ".join(
+            f"{k}: {v:.4f}" for k, v in sorted(losses.items())
+        )
         self._log(
             f"Step {step:>6d}/{self.total_steps} | "
-            f"loss: {losses.get('lm', 0):.4f} | "
-            f"ntp: {losses.get('ntp', 0):.4f} | "
-            f"mtp: {losses.get('mtp', 0):.4f} | "
-            f"kl: {losses.get('kl', 0):.4f} | "
+            f"{metrics_str} | "
             f"lr: {lr:.2e} | "
             f"grad_norm: {grad_norm:.4f} | "
             f"tok/s: {tok_per_sec:,.0f} | "
@@ -298,20 +319,17 @@ class Trainer:
         )
 
         if self.wandb_run:
-            self.wandb_run.log(
+            wandb_metrics = {f"train/{k}": v for k, v in losses.items()}
+            wandb_metrics.update(
                 {
-                    "train/lm_loss": losses.get("lm", 0),
-                    "train/ntp_loss": losses.get("ntp", 0),
-                    "train/mtp_loss": losses.get("mtp", 0),
-                    "train/kl_loss": losses.get("kl", 0),
                     "train/lr": lr,
                     "train/grad_norm": grad_norm,
                     "train/tok_per_sec": tok_per_sec,
                     "train/mem_mb": mem_mb,
                     "train/step": step,
-                },
-                step=step,
+                }
             )
+            self.wandb_run.log(wandb_metrics, step=step)
 
     def _set_lr(self, lr: float):
         for opt in self.optimizers:
@@ -1507,12 +1525,15 @@ class DPOTrainer(Trainer):
             total_loss.backward()
 
         return {
-            "ntp": metrics["total_loss"].item(),
-            "lm": metrics["total_loss"].item(),
-            "dpo_acc": metrics["accuracy"].item(),
-            "log_ratio_mean": metrics["log_ratio_mean"].item(),
-            "log_ratio_std": metrics["log_ratio_std"].item(),
-            "log_ratio_diff": metrics["log_ratio_diff_mean"].item(),
+            "loss": metrics["total_loss"].item(),
+            "acc": metrics["accuracy"].item(),
+            "margin_raw": metrics["raw_margin_mean"].item(),
+            "margin_beta": metrics["scaled_margin_mean"].item(),
+            "conf": metrics["pair_confidence_mean"].item(),
+            "chosen_lr": metrics["chosen_log_ratio_mean"].item(),
+            "rejected_lr": metrics["rejected_log_ratio_mean"].item(),
+            "lr_mean": metrics["log_ratio_mean"].item(),
+            "lr_abs": metrics["log_ratio_abs_mean"].item(),
             "reward_margin": reward_margin.item(),
         }
 
@@ -1585,9 +1606,14 @@ class DPOTrainer(Trainer):
             for k in [
                 "total_loss",
                 "accuracy",
+                "raw_margin_mean",
+                "scaled_margin_mean",
+                "pair_confidence_mean",
+                "chosen_log_ratio_mean",
+                "rejected_log_ratio_mean",
                 "log_ratio_mean",
                 "log_ratio_std",
-                "log_ratio_diff_mean",
+                "log_ratio_abs_mean",
             ]:
                 accum[k] = accum.get(k, 0.0) + metrics[k].item()
             accum["response_logp"] = (
@@ -1618,13 +1644,288 @@ class DPOTrainer(Trainer):
         result["val/kl_loss"] = 0.0
 
         self._log(
-            f"  VAL: top1={accum.get('top1', 0):.3f} "
-            f"pairwise={accum.get('pairwise', 0):.3f} "
-            f"spearman={accum.get('spearman', 0):.3f} | "
-            f"dpo_acc={accum.get('accuracy', 0):.3f} "
-            f"resp_score={accum.get('response_logp', 0):.2f} | "
-            f"total_loss={accum.get('total_loss', 0):.4f} "
-            f"diff={accum.get('log_ratio_diff_mean', 0):.4f}"
+            f"  VAL: "
+            f"top1: {accum.get('top1', 0):.3f} | "
+            f"pairwise: {accum.get('pairwise', 0):.3f} | "
+            f"spearman: {accum.get('spearman', 0):.3f} | "
+            f"loss: {accum.get('total_loss', 0):.4f} | "
+            f"acc: {accum.get('accuracy', 0):.3f} | "
+            f"resp: {accum.get('response_logp', 0):.2f} | "
+            f"margin(raw): {accum.get('raw_margin_mean', 0):.4f} | "
+            f"margin(beta): {accum.get('scaled_margin_mean', 0):.4f} | "
+            f"chosen_lr: {accum.get('chosen_log_ratio_mean', 0):.4f} | "
+            f"rejected_lr: {accum.get('rejected_log_ratio_mean', 0):.4f} | "
+            f"conf: {accum.get('pair_confidence_mean', 0):.3f} | "
+            f"lr_abs: {accum.get('log_ratio_abs_mean', 0):.4f}"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # LR schedule
+    # ------------------------------------------------------------------
+
+    def get_lr(self, step: int) -> float:
+        return cosine_annealing_lr_schedule(
+            step, self.lr, self.lr_min, self.warmup_steps, self.total_steps
+        )
+
+    # ------------------------------------------------------------------
+    # Optimizer step
+    # ------------------------------------------------------------------
+
+    def _optimizer_step(self) -> float:
+        gn = grad_clip(self.model.parameters(), self.max_grad_norm)
+        for opt in self.optimizers:
+            opt.step()
+        self.model.zero_grad()
+        return gn
+
+
+class SimPOTrainer(Trainer):
+
+    def __init__(self, args: SimPOTrainerArgs):
+        super().__init__(args)
+        self._model_args: Optional[DSArgs] = None
+        self.base_model_ckpt_path = args.base_model_path
+
+    def build_model_and_optimizers(self):
+        cfg = MODEL_CONFIGS[self.config_name].copy()
+        cfg["max_seq_len"] = self.max_seq_len
+        self.max_seq_len = cfg["max_seq_len"]
+
+        base_fields = DSArgs.__dataclass_fields__
+        args = DSArgs(**{k: v for k, v in cfg.items() if k in base_fields})
+
+        needed = args.n_layer + args.n_mtp_layer
+        if len(args.compress_ratios) < needed:
+            args.compress_ratios = args.compress_ratios + tuple(
+                [0] * (needed - len(args.compress_ratios))
+            )
+
+        self._model_args = args
+
+        model = DeepSeekV4(args)
+        model.train()
+        model = model.to(self.local_rank)
+
+        ckpt = torch.load(
+            self.base_model_ckpt_path,
+            map_location=f"cuda:{self.local_rank}",
+            weights_only=False,
+        )
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        muon_p, adamw_p = group_params(model)
+        idx_p = get_indexer_params(model)
+
+        muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
+        adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+        idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+
+        self.optimizers = [muon_opt, adamw_opt, idx_opt]
+
+        if self.world_size > 1:
+            self.model = DDP(
+                model, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+        else:
+            self.model = model
+
+        if self.is_main:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            self._log(
+                f"Model: {self.config_name} | "
+                f"Params: {total_params/1e6:.1f}M total, {trainable/1e6:.1f}M trainable | "
+                f"d_model={args.d_model}, n_layer={args.n_layer}, "
+                f"n_experts={args.n_experts}, seq_len={args.max_seq_len}"
+            )
+
+    def build_dataloaders(self):
+        if not self.data_train:
+            raise ValueError("--data-train is required")
+
+        train_dataset = SimPODataset(self.data_train)
+        train_sampler = None
+        if self.world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False,
+            )
+        self.train_loader = DataLoader(
+            train_dataset, batch_size=self.batch_size, shuffle=False,
+            sampler=train_sampler, num_workers=self.num_workers,
+            pin_memory=True, drop_last=True,
+        )
+
+        if self.data_val:
+            val_dataset = SimPODataset(self.data_val)
+            val_sampler = None
+            if self.world_size > 1:
+                val_sampler = DistributedSampler(
+                    val_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False,
+                )
+            self.val_loader = DataLoader(
+                val_dataset, batch_size=self.batch_size, shuffle=False,
+                sampler=val_sampler, num_workers=self.num_workers,
+                pin_memory=True, drop_last=False,
+            )
+        else:
+            self.val_loader = None
+
+        if self.is_main:
+            self._log(
+                f"Train data: {self.data_train} | "
+                f"{len(train_dataset):,} samples | "
+                f"batch={self.batch_size}, seq_len={self.max_seq_len}"
+            )
+            if self.val_loader:
+                self._log(f"Val data: {self.data_val} | {len(val_dataset):,} samples")
+
+    def train_step(self, batch, is_last_micro):
+        w_ids, w_mask, l_ids, l_mask = batch  # each (bs, seq_len)
+        bs = w_ids.shape[0]
+
+        # Forward: winner + loser together
+        all_ids = torch.cat([w_ids, l_ids], dim=0)
+        all_ids = all_ids.to(self.local_rank, non_blocking=True)
+
+        ntp, mtp_list, idx_data = self.model(all_ids[..., :-1].contiguous())
+        ntp_w, ntp_l = ntp.chunk(2, dim=0)  # split winner / loser
+
+        w_ids = w_ids.to(self.local_rank, non_blocking=True)
+        l_ids = l_ids.to(self.local_rank, non_blocking=True)
+        w_mask = w_mask.to(self.local_rank, non_blocking=True)
+        l_mask = l_mask.to(self.local_rank, non_blocking=True)
+
+        # ---- SFT losses on winner (same as SFTTrainer) ----
+        ntp_loss = cross_entropy_masked(w_ids[..., 1:], ntp_w, w_mask[..., :-1])
+        mtp_loss = sum(
+            cross_entropy_masked(
+                w_ids[..., i + 2 :], m[: bs, : -(1 + i)], w_mask[..., :-(i+2)]
+            )
+            for i, m in enumerate(mtp_list)
+        )
+        kl_loss = sum(
+            indexer_kl_loss(iscore, idx, wc.detach() if wc is not None else None)
+            for (iscore, wc, idx) in idx_data
+        )
+
+        # ---- SimPO loss ----
+        spo = simpo_loss(
+            logits_winner=ntp_w,
+            logits_loser=ntp_l,
+            winner_ids=w_ids[..., 1:],
+            loser_ids=l_ids[..., 1:],
+            winner_mask=w_mask[..., :-1],
+            loser_mask=l_mask[..., :-1],
+            beta=self.beta,
+            gamma=self.gamma,
+        )
+
+        lm_loss = ntp_loss + 0.3 * mtp_loss
+        total_loss = (lm_loss + 0.5 * kl_loss + self.lambda_simpo * spo["simpo_loss"]) / self.grad_accum
+
+        if self.world_size > 1 and not is_last_micro:
+            with self.model.no_sync():
+                total_loss.backward()
+        else:
+            total_loss.backward()
+
+        return {
+            "ntp": ntp_loss.item(),
+            "lm": lm_loss.item(),
+            "mtp": mtp_loss.item(),
+            "kl": kl_loss.item(),
+            "simpo": spo["simpo_loss"].item(),
+            "margin": spo["margin"].item(),
+            "acc": spo["acc"].item(),
+        }
+
+    @torch.no_grad()
+    def validate(self, max_val_batches: int = 100) -> Dict[str, float]:
+        if not self.val_loader:
+            return {}
+
+        self.model.eval()
+
+        accum: Dict[str, float] = {}
+        num_batches = 0
+
+        for batch in self.val_loader:
+            if num_batches >= max_val_batches:
+                break
+
+            w_ids, w_mask, l_ids, l_mask = batch
+
+            all_ids = torch.cat([w_ids, l_ids], dim=0)
+            all_ids = all_ids.to(self.local_rank, non_blocking=True)
+
+            ntp, mtp_list, idx_data = self.model(all_ids[..., :-1].contiguous())
+            ntp_w, ntp_l = ntp.chunk(2, dim=0)
+            bs = w_ids.shape[0]
+
+            w_ids = w_ids.to(self.local_rank, non_blocking=True)
+            l_ids = l_ids.to(self.local_rank, non_blocking=True)
+            w_mask = w_mask.to(self.local_rank, non_blocking=True)
+            l_mask = l_mask.to(self.local_rank, non_blocking=True)
+
+            ntp_loss = cross_entropy_masked(w_ids[..., 1:], ntp_w, w_mask[..., :-1])
+            mtp_loss = sum(
+                cross_entropy_masked(
+                    w_ids[..., i + 2 :], m[: bs, : -(1 + i)], w_mask[..., :-(i+2)]
+                )
+                for i, m in enumerate(mtp_list)
+            )
+            kl_loss = sum(
+                indexer_kl_loss(iscore, idx, wc)
+                for (iscore, wc, idx) in idx_data
+            )
+
+            spo = simpo_loss(
+                logits_winner=ntp_w,
+                logits_loser=ntp_l,
+                winner_ids=w_ids[..., 1:],
+                loser_ids=l_ids[..., 1:],
+                winner_mask=w_mask[..., :-1],
+                loser_mask=l_mask[..., :-1],
+                beta=self.beta,
+                gamma=self.gamma,
+            )
+
+            for k in ["margin", "acc"]:
+                accum[k] = accum.get(k, 0.0) + spo[k].item()
+            for k, v in [("ntp", ntp_loss), ("mtp", mtp_loss), ("kl", kl_loss),
+                          ("simpo", spo["simpo_loss"])]:
+                accum[k] = accum.get(k, 0.0) + v.item()
+            num_batches += 1
+
+        self.model.train()
+
+        for k in accum:
+            accum[k] /= num_batches
+
+        if self.world_size > 1:
+            keys = sorted(accum.keys())
+            vals = [accum[k] for k in keys]
+            t = torch.tensor(vals, device=self.local_rank)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t /= self.world_size
+            for k, v in zip(keys, t.tolist()):
+                accum[k] = v
+
+        lm = accum.get("ntp", 0) + 0.3 * accum.get("mtp", 0)
+        result = {f"val/{k}": v for k, v in accum.items()}
+        result["val/lm_loss"] = lm
+        result["val/ntp_loss"] = accum.get("ntp", 0)
+
+        self._log(
+            f"  VAL: ntp={accum.get('ntp', 0):.4f} "
+            f"mtp={accum.get('mtp', 0):.4f} "
+            f"simpo={accum.get('simpo', 0):.4f} "
+            f"margin={accum.get('margin', 0):.4f} "
+            f"acc={accum.get('acc', 0):.3f}"
         )
         return result
 

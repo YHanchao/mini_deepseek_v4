@@ -129,3 +129,46 @@ class GRPOOffPolicyDataset(Dataset):
 
 
 DPODataset = GRPOOffPolicyDataset
+
+
+class SimPODataset(Dataset):
+    """SimPO dataset: winner + lowest-score loser per group.
+
+    Each item is a (winner_ids, winner_mask, loser_ids, loser_mask) tuple.
+    """
+
+    def __init__(self, filepath: str):
+        data = torch.load(filepath)
+        ids = data["input_ids"]         # (4N, seq_len)
+        mask = data["completion_mask"]  # (4N, seq_len)
+        is_winner = data["is_winner"]   # (4N,)
+        scores = data["scores"].float().mean(dim=-1)  # (4N,)
+
+        n_groups = len(ids) // 4
+        ids = ids.reshape(n_groups, 4, -1)
+        mask = mask.reshape(n_groups, 4, -1)
+        winner = is_winner.reshape(n_groups, 4)
+        scores = scores.reshape(n_groups, 4)
+
+        # winner
+        idx = torch.arange(n_groups, device=ids.device)
+        win_idx = winner.nonzero(as_tuple=True)[1]
+        self.winner_ids = ids[idx, win_idx].clone()
+        self.winner_mask = mask[idx, win_idx].clone()
+
+        # loser = lowest score (excluding winner)
+        scores_masked = scores.masked_fill(winner, float("inf"))
+        lose_idx = scores_masked.argmin(dim=-1)
+        self.loser_ids = ids[idx, lose_idx].clone()
+        self.loser_mask = mask[idx, lose_idx].clone()
+
+    def __len__(self):
+        return len(self.winner_ids)
+
+    def __getitem__(self, idx):
+        return (
+            self.winner_ids[idx],
+            self.winner_mask[idx],
+            self.loser_ids[idx],
+            self.loser_mask[idx],
+        )

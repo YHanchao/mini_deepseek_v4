@@ -254,27 +254,81 @@ def dpo_loss(
     rejected_lr = torch.where(pref_mask, log_ratio_j, log_ratio_i)
 
     # 4. DPO loss: -log(sigmoid(beta * (chosen - rejected)))
-    diff = beta * (chosen_lr - rejected_lr)
+    raw_margin = chosen_lr - rejected_lr
+    diff = beta * raw_margin
     pair_loss = -torch.nn.functional.logsigmoid(diff)
 
     valid = ~tie_mask
     valid_count = valid.sum().clamp(min=1)
     total_loss = (pair_loss * valid).sum() / valid_count
 
-    # 5. Accuracy: fraction of valid pairs correctly ordered
-    correct = (diff > 0) & valid
+    # 5. Accuracy: fraction of valid pairs correctly ordered (raw_margin > 0)
+    correct = (raw_margin > 0) & valid
     accuracy = correct.float().sum() / valid_count
+
+    # 6. Monitoring metrics over valid pairs
+    def _valid_mean(x):
+        return x[valid].mean() if valid.any() else torch.tensor(0.0, device=scores.device)
 
     return {
         "total_loss": total_loss,
         "accuracy": accuracy,
+        # DPO signal
+        "raw_margin_mean": _valid_mean(raw_margin),
+        "scaled_margin_mean": _valid_mean(diff),
+        "pair_confidence_mean": _valid_mean(torch.sigmoid(diff)),
+        # chosen/rejected separation
+        "chosen_log_ratio_mean": _valid_mean(chosen_lr),
+        "rejected_log_ratio_mean": _valid_mean(rejected_lr),
+        # policy drift
         "log_ratio_mean": log_ratio.mean(),
         "log_ratio_std": log_ratio.std(),
-        "log_ratio_diff_mean": (
-            diff[valid].mean()
-            if valid.any()
-            else torch.tensor(0.0, device=scores.device)
-        ),
+        "log_ratio_abs_mean": log_ratio.abs().mean(),
+        # for downstream ranking metrics
         "logp_w": logp_w,
         "logp_r": logp_r,
+    }
+
+
+def logp_from_logits(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """Extract per-token log-probabilities from logits."""
+    return (
+        torch.log_softmax(logits, dim=-1)
+        .gather(dim=-1, index=token_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+
+def simpo_loss(
+    logits_winner: torch.Tensor,
+    logits_loser: torch.Tensor,
+    winner_ids: torch.Tensor,
+    loser_ids: torch.Tensor,
+    winner_mask: torch.Tensor,
+    loser_mask: torch.Tensor,
+    beta: float = 1.0,
+    gamma: float = 0.1,
+):
+    """Pure SimPO pairwise preference loss.
+
+    L_SimPO = -log σ(β * (r_w - r_l) - γ)
+
+    where r = Σ_masked(logp) / length for each response.
+
+    Returns dict with simpo_loss, margin, acc.
+    """
+    logp_w = logp_from_logits(logits_winner, winner_ids) * winner_mask.float()
+    logp_l = logp_from_logits(logits_loser, loser_ids) * loser_mask.float()
+
+    w_len = winner_mask.float().sum(dim=-1).clamp(min=1)
+    l_len = loser_mask.float().sum(dim=-1).clamp(min=1)
+    r_w = logp_w.sum(dim=-1) / w_len
+    r_l = logp_l.sum(dim=-1) / l_len
+
+    simpo = -torch.nn.functional.logsigmoid(beta * (r_w - r_l) - gamma)
+
+    return {
+        "simpo_loss": simpo.mean(),
+        "margin": (r_w - r_l).mean(),
+        "acc": (r_w > r_l).float().mean(),
     }
