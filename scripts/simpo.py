@@ -42,6 +42,7 @@ def get_args():
     p.add_argument("--keep-last-ckpt", type=int, default=2)
     p.add_argument("--wandb-project", type=str, default="")
     p.add_argument("--resume", type=str, default="")
+    p.add_argument("--resume-step", type=bool, default=False)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-grad-norm", type=float, default=5.0)
