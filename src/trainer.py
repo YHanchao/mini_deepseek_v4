@@ -192,6 +192,10 @@ class WeightedSFTTrainerArgs(TrainerArgs):
     warmup_steps: int = 2000
     uniform: bool = False
 
+    beta: float = 2.0
+    gamma: float = 0.0
+    lambda_simpo: float = 0.0
+
     num_workers: int = 0
 
 
@@ -2120,7 +2124,15 @@ class WeightedSFTTrainer(Trainer):
             for (iscore, wc, idx) in idx_data
         )
 
-        total_loss = (wsft["total_loss"] + 0.5 * kl_loss) / self.grad_accum
+        spo = simpo_loss(
+            logits=ntp[:, [0, 3]],
+            ids=ids[:, [0, 3], 1:],
+            mask=mask[:, [0, 3], :-1],
+            beta=self.beta,
+            gamma=self.gamma,
+        )
+
+        total_loss = (wsft["total_loss"] + 0.5 * kl_loss + self.lambda_simpo * spo["simpo_loss"]) / self.grad_accum
 
         if self.world_size > 1 and not is_last_micro:
             with self.model.no_sync():
@@ -2137,6 +2149,9 @@ class WeightedSFTTrainer(Trainer):
             "margin_raw": wsft["raw_margin_mean"].item(),
             "chosen_lp": wsft["chosen_lr_mean"].item(),
             "rejected_lp": wsft["rejected_lr_mean"].item(),
+            "simpo": spo["simpo_loss"].item(),
+            "spo_acc": spo["accs"][0].item(),
+            "spo_margin": spo["margins"][0].item(),
         }
 
     @torch.no_grad()
@@ -2178,10 +2193,21 @@ class WeightedSFTTrainer(Trainer):
                 indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
             )
 
+            spo = simpo_loss(
+                logits=ntp[:, [0, 3]],
+                ids=ids[:, [0, 3], 1:],
+                mask=mask[:, [0, 3], :-1],
+                beta=self.beta,
+                gamma=self.gamma,
+            )
+
             for k in ["ntp_loss", "mtp_loss", "total_loss",
                        "pair_acc", "raw_margin_mean", "chosen_lr_mean", "rejected_lr_mean"]:
                 accum[k] = accum.get(k, 0.0) + wsft[k].item()
             accum["kl"] = accum.get("kl", 0.0) + kl_loss.item()
+            accum["simpo"] = accum.get("simpo", 0.0) + spo["simpo_loss"].item()
+            accum["spo_acc"] = accum.get("spo_acc", 0.0) + spo["accs"][0].item()
+            accum["spo_margin"] = accum.get("spo_margin", 0.0) + spo["margins"][0].item()
 
             # per-response log probs for ranking
             logp = wsft["logp"]  # (bs, 4)
@@ -2217,7 +2243,10 @@ class WeightedSFTTrainer(Trainer):
             f"mtp={accum.get('mtp_loss', 0):.4f} "
             f"kl={accum.get('kl', 0):.4f} | "
             f"top1={accum.get('top1', 0):.3f} "
-            f"pair_acc={accum.get('pair_acc', 0):.3f} "
+            f"pair_acc={accum.get('pair_acc', 0):.3f} | "
+            f"simpo={accum.get('simpo', 0):.4f} "
+            f"spo_acc={accum.get('spo_acc', 0):.3f} "
+            f"spo_m={accum.get('spo_margin', 0):.4f}"
             f"margin={accum.get('raw_margin_mean', 0):.4f} | "
             f"chosen_lp={accum.get('chosen_lr_mean', 0):.3f} "
             f"rejected_lp={accum.get('rejected_lr_mean', 0):.3f} | "

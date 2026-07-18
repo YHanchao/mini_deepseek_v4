@@ -322,7 +322,7 @@ def simpo_loss(
     length = mask.float().sum(dim=-1).clamp(min=1)
     r = logp.sum(dim=-1) / length  # (bs, 4)  length-normalized scores
 
-    diff = r[:, 0:1] - r[:, 1:4]  # (bs, 3)  winner minus each loser
+    diff = r[:, 0:1] - r[:, 1:]  # (bs, n_losers)  winner minus each loser
     losses = -torch.nn.functional.logsigmoid(beta * diff - gamma)  # (bs, 3)
 
     return {

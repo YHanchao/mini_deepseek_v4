@@ -34,6 +34,9 @@ def get_args():
     p.add_argument("--resume-step", type=bool, default=False)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--uniform", action="store_true", default=False)
+    p.add_argument("--beta", type=float, default=2.0)
+    p.add_argument("--gamma", type=float, default=0.0)
+    p.add_argument("--lambda-simpo", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument(
         "--base-model-path", type=str, default="checkpoints/roast_sft/ckpt_best.pt"
