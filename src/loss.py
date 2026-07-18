@@ -340,6 +340,7 @@ def weighted_sft_loss(
     ids: torch.Tensor,
     mask: torch.Tensor,
     scores: torch.Tensor,
+    uniform: bool = False,
 ):
     """Weighted SFT: all 4 responses contribute, weighted by score / max_score.
 
@@ -355,11 +356,15 @@ def weighted_sft_loss(
     """
     bs, gs = ids.shape[:2]
 
-    # ---- weights: linear map to [0.1, 1.0] ----
-    s_min = scores.min(dim=-1, keepdim=True).values
-    s_max = scores.max(dim=-1, keepdim=True).values
-    s_range = (s_max - s_min).clamp(min=1e-8)
-    w = 0.1 + 0.9 * (scores - s_min) / s_range  # (bs, 4)
+    # ---- weights ----
+    if uniform:
+        w = torch.ones_like(scores)  # all equal
+    else:
+        # linear map to [0.1, 1.0]
+        s_min = scores.min(dim=-1, keepdim=True).values
+        s_max = scores.max(dim=-1, keepdim=True).values
+        s_range = (s_max - s_min).clamp(min=1e-8)
+        w = 0.1 + 0.9 * (scores - s_min) / s_range  # (bs, 4)
 
     # ---- NTP weighted CE ----
     logp_ntp = torch.log_softmax(logits_ntp, dim=-1)  # (bs, 4, seq-1, vocab)

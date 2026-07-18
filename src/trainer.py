@@ -190,6 +190,7 @@ class WeightedSFTTrainerArgs(TrainerArgs):
     lr: float = 2.7e-4
     lr_min: float = 2.7e-5
     warmup_steps: int = 2000
+    uniform: bool = False
 
     num_workers: int = 0
 
@@ -2112,6 +2113,7 @@ class WeightedSFTTrainer(Trainer):
             ids=ids,
             mask=mask,
             scores=scores,
+            uniform=self.uniform,
         )
         kl_loss = sum(
             indexer_kl_loss(iscore, idx, wc.detach() if wc is not None else None)
@@ -2170,6 +2172,7 @@ class WeightedSFTTrainer(Trainer):
                 ids=ids,
                 mask=mask,
                 scores=scores,
+                uniform=self.uniform,
             )
             kl_loss = sum(
                 indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
