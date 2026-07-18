@@ -21,7 +21,9 @@ def get_args():
     p = argparse.ArgumentParser(description="SimPO + SFT DeepSeekV4 mini")
 
     p.add_argument("--config-name", type=str, default="small")
-    p.add_argument("--data-train", type=str, default="data/llm/roast/grpo_offpolicy/train.pt")
+    p.add_argument(
+        "--data-train", type=str, default="data/llm/roast/grpo_offpolicy/train.pt"
+    )
     p.add_argument("--data-val", type=str, default="data/llm/roast/val/grpo.pt")
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--grad-accum", type=int, default=4)
@@ -42,6 +44,7 @@ def get_args():
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--max-grad-norm", type=float, default=5.0)
     p.add_argument(
         "--base-model-path",
         type=str,
