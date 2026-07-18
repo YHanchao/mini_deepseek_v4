@@ -132,9 +132,10 @@ DPODataset = GRPOOffPolicyDataset
 
 
 class SimPODataset(Dataset):
-    """SimPO dataset: winner + lowest-score loser per group.
+    """SimPO dataset: winner + 3 losers per group sorted by score.
 
-    Each item is a (winner_ids, winner_mask, loser_ids, loser_mask) tuple.
+    Returns (ids, mask) each of shape (4, seq_len):
+        [0] = winner, [1] = best loser, [2] = middle loser, [3] = worst loser.
     """
 
     def __init__(self, filepath: str):
@@ -145,30 +146,30 @@ class SimPODataset(Dataset):
         scores = data["scores"].float().mean(dim=-1)  # (4N,)
 
         n_groups = len(ids) // 4
-        ids = ids.reshape(n_groups, 4, -1)
-        mask = mask.reshape(n_groups, 4, -1)
-        winner = is_winner.reshape(n_groups, 4)
-        scores = scores.reshape(n_groups, 4)
+        ids = ids.reshape(n_groups, 4, -1).numpy()
+        mask = mask.reshape(n_groups, 4, -1).numpy()
+        winner = is_winner.reshape(n_groups, 4).numpy()
+        scores = scores.reshape(n_groups, 4).numpy()
 
-        # winner
-        idx = torch.arange(n_groups, device=ids.device)
-        win_idx = winner.nonzero(as_tuple=True)[1]
-        self.winner_ids = ids[idx, win_idx].clone()
-        self.winner_mask = mask[idx, win_idx].clone()
+        self.ids = torch.empty(n_groups, 4, ids.shape[-1], dtype=torch.long, device="cpu")
+        self.mask = torch.empty(n_groups, 4, mask.shape[-1], dtype=torch.bool, device="cpu")
 
-        # loser = lowest score (excluding winner)
-        scores_masked = scores.masked_fill(winner, float("inf"))
-        lose_idx = scores_masked.argmin(dim=-1)
-        self.loser_ids = ids[idx, lose_idx].clone()
-        self.loser_mask = mask[idx, lose_idx].clone()
+        for i in range(n_groups):
+            w = int(winner[i].nonzero()[0][0])
+            self.ids[i, 0] = torch.from_numpy(ids[i, w])
+            self.mask[i, 0] = torch.from_numpy(mask[i, w])
+
+            loser_mask = ~winner[i]
+            loser_scores = scores[i][loser_mask]
+            order = loser_scores.argsort()[::-1]
+            loser_ids_arr = ids[i][loser_mask][order]
+            loser_masks_arr = mask[i][loser_mask][order]
+            for j in range(3):
+                self.ids[i, 1 + j] = torch.from_numpy(loser_ids_arr[j])
+                self.mask[i, 1 + j] = torch.from_numpy(loser_masks_arr[j])
 
     def __len__(self):
-        return len(self.winner_ids)
+        return len(self.ids)
 
     def __getitem__(self, idx):
-        return (
-            self.winner_ids[idx],
-            self.winner_mask[idx],
-            self.loser_ids[idx],
-            self.loser_mask[idx],
-        )
+        return self.ids[idx], self.mask[idx]  # (4, seq_len), (4, seq_len)

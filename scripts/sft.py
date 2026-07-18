@@ -41,6 +41,7 @@ def get_args():
     p.add_argument("--keep-last-ckpt", type=int, default=1)
     p.add_argument("--wandb-project", type=str, default="")
     p.add_argument("--resume", type=str, default="")
+    p.add_argument("--resume-step", type=bool, default=False)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--data-mix", type=str, default="")

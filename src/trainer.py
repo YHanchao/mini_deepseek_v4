@@ -67,6 +67,7 @@ class TrainerArgs:
 
     # Resume
     resume: str = ""
+    resume_step: bool = True
 
 
 @dataclass
@@ -265,7 +266,10 @@ class Trainer:
             torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
         extra = state.get("extra", {})
 
-        return state["step"] + 1, extra
+        if self.resume_step:
+            return state["step"] + 1, extra
+        else:
+            return 0, {}
 
     def _cleanup_checkpoints(self):
         if not self.is_main:
@@ -756,25 +760,6 @@ class SFTTrainer(Trainer):
         super().__init__(args)
         self._model_args: Optional[DSArgs] = None
         self.base_model_ckpt_path = args.base_model_path
-
-    def load_checkpoint(self, path: str) -> Tuple[int, Dict]:
-        """
-        SFT 中，我现在需要换一个数据集做SFT，但是沿用上一轮的Adam状态。所以此处step我要重置
-        """
-        state = torch.load(
-            path, map_location=f"cuda:{self.local_rank}", weights_only=False
-        )
-        model = self.model.module if isinstance(self.model, DDP) else self.model
-        model.load_state_dict(state["model_state_dict"])
-
-        for opt, sd in zip(self.optimizers, state["optimizers_state_dict"]):
-            opt.load_state_dict(sd)
-        torch.set_rng_state(state["torch_rng_state"].cpu())
-
-        if state.get("cuda_rng_state") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
-
-        return 0, {}
 
     def build_model_and_optimizers(self):
         cfg = MODEL_CONFIGS[self.config_name].copy()
@@ -1688,25 +1673,6 @@ class SimPOTrainer(Trainer):
         self._model_args: Optional[DSArgs] = None
         self.base_model_ckpt_path = args.base_model_path
 
-    def load_checkpoint(self, path: str) -> Tuple[int, Dict]:
-        """
-        SFT 中，我现在需要换一个数据集做SFT，但是沿用上一轮的Adam状态。所以此处step我要重置
-        """
-        state = torch.load(
-            path, map_location=f"cuda:{self.local_rank}", weights_only=False
-        )
-        model = self.model.module if isinstance(self.model, DDP) else self.model
-        model.load_state_dict(state["model_state_dict"])
-
-        for opt, sd in zip(self.optimizers, state["optimizers_state_dict"]):
-            opt.load_state_dict(sd)
-        torch.set_rng_state(state["torch_rng_state"].cpu())
-
-        if state.get("cuda_rng_state") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
-
-        return 0, {}
-
     def build_model_and_optimizers(self):
         cfg = MODEL_CONFIGS[self.config_name].copy()
         cfg["max_seq_len"] = self.max_seq_len
@@ -1803,26 +1769,27 @@ class SimPOTrainer(Trainer):
                 self._log(f"Val data: {self.data_val} | {len(val_dataset):,} samples")
 
     def train_step(self, batch, is_last_micro):
-        w_ids, w_mask, l_ids, l_mask = batch  # each (bs, seq_len)
-        bs = w_ids.shape[0]
+        ids, mask = batch  # each (bs, 4, seq_len)
+        bs = ids.shape[0]
 
-        # Forward: winner + loser together
-        all_ids = torch.cat([w_ids, l_ids], dim=0)
+        # Forward: all 4 candidates together
+        all_ids = ids.reshape(bs * 4, -1)
         all_ids = all_ids.to(self.local_rank, non_blocking=True)
 
         ntp, mtp_list, idx_data = self.model(all_ids[..., :-1].contiguous())
-        ntp_w, ntp_l = ntp.chunk(2, dim=0)  # split winner / loser
+        ntp = ntp.reshape(bs, 4, -1, ntp.shape[-1])  # (bs, 4, seq-1, vocab)
 
-        w_ids = w_ids.to(self.local_rank, non_blocking=True)
-        l_ids = l_ids.to(self.local_rank, non_blocking=True)
-        w_mask = w_mask.to(self.local_rank, non_blocking=True)
-        l_mask = l_mask.to(self.local_rank, non_blocking=True)
+        ids = ids.to(self.local_rank, non_blocking=True)
+        mask = mask.to(self.local_rank, non_blocking=True)
 
-        # ---- SFT losses on winner (same as SFTTrainer) ----
-        ntp_loss = cross_entropy_masked(w_ids[..., 1:], ntp_w, w_mask[..., :-1])
+        # ---- SFT losses on winner (index 0) ----
+        ntp_loss = cross_entropy_masked(ids[:, 0, 1:], ntp[:, 0], mask[:, 0, :-1])
+        # MTP on winner: each head produces (bs*4, seq-1, vocab), take winner slice
         mtp_loss = sum(
             cross_entropy_masked(
-                w_ids[..., i + 2 :], m[: bs, : -(1 + i)], w_mask[..., :-(i+2)]
+                ids[:, 0, i + 2:],
+                m.reshape(bs, 4, -1, m.shape[-1])[:, 0, :-(1 + i)],
+                mask[:, 0, :-(i + 2)],
             )
             for i, m in enumerate(mtp_list)
         )
@@ -1831,14 +1798,11 @@ class SimPOTrainer(Trainer):
             for (iscore, wc, idx) in idx_data
         )
 
-        # ---- SimPO loss ----
+        # ---- SimPO loss: winner vs all 3 losers ----
         spo = simpo_loss(
-            logits_winner=ntp_w,
-            logits_loser=ntp_l,
-            winner_ids=w_ids[..., 1:],
-            loser_ids=l_ids[..., 1:],
-            winner_mask=w_mask[..., :-1],
-            loser_mask=l_mask[..., :-1],
+            logits=ntp,
+            ids=ids[..., 1:],
+            mask=mask[..., :-1],
             beta=self.beta,
             gamma=self.gamma,
         )
@@ -1858,8 +1822,9 @@ class SimPOTrainer(Trainer):
             "mtp": mtp_loss.item(),
             "kl": kl_loss.item(),
             "simpo": spo["simpo_loss"].item(),
-            "margin": spo["margin"].item(),
-            "acc": spo["acc"].item(),
+            "pair_acc": spo["pair_acc"].item(),
+            "m1": spo["margins"][0].item(), "m2": spo["margins"][1].item(), "m3": spo["margins"][2].item(),
+            "a1": spo["accs"][0].item(), "a2": spo["accs"][1].item(), "a3": spo["accs"][2].item(),
         }
 
     @torch.no_grad()
@@ -1876,24 +1841,24 @@ class SimPOTrainer(Trainer):
             if num_batches >= max_val_batches:
                 break
 
-            w_ids, w_mask, l_ids, l_mask = batch
+            ids, mask = batch  # (bs, 4, seq_len)
+            bs = ids.shape[0]
 
-            all_ids = torch.cat([w_ids, l_ids], dim=0)
+            all_ids = ids.reshape(bs * 4, -1)
             all_ids = all_ids.to(self.local_rank, non_blocking=True)
 
             ntp, mtp_list, idx_data = self.model(all_ids[..., :-1].contiguous())
-            ntp_w, ntp_l = ntp.chunk(2, dim=0)
-            bs = w_ids.shape[0]
+            ntp = ntp.reshape(bs, 4, -1, ntp.shape[-1])
 
-            w_ids = w_ids.to(self.local_rank, non_blocking=True)
-            l_ids = l_ids.to(self.local_rank, non_blocking=True)
-            w_mask = w_mask.to(self.local_rank, non_blocking=True)
-            l_mask = l_mask.to(self.local_rank, non_blocking=True)
+            ids = ids.to(self.local_rank, non_blocking=True)
+            mask = mask.to(self.local_rank, non_blocking=True)
 
-            ntp_loss = cross_entropy_masked(w_ids[..., 1:], ntp_w, w_mask[..., :-1])
+            ntp_loss = cross_entropy_masked(ids[:, 0, 1:], ntp[:, 0], mask[:, 0, :-1])
             mtp_loss = sum(
                 cross_entropy_masked(
-                    w_ids[..., i + 2 :], m[: bs, : -(1 + i)], w_mask[..., :-(i+2)]
+                    ids[:, 0, i + 2:],
+                    m.reshape(bs, 4, -1, m.shape[-1])[:, 0, :-(1 + i)],
+                    mask[:, 0, :-(i + 2)],
                 )
                 for i, m in enumerate(mtp_list)
             )
@@ -1903,21 +1868,21 @@ class SimPOTrainer(Trainer):
             )
 
             spo = simpo_loss(
-                logits_winner=ntp_w,
-                logits_loser=ntp_l,
-                winner_ids=w_ids[..., 1:],
-                loser_ids=l_ids[..., 1:],
-                winner_mask=w_mask[..., :-1],
-                loser_mask=l_mask[..., :-1],
+                logits=ntp,
+                ids=ids[..., 1:],
+                mask=mask[..., :-1],
                 beta=self.beta,
                 gamma=self.gamma,
             )
 
-            for k in ["margin", "acc"]:
-                accum[k] = accum.get(k, 0.0) + spo[k].item()
             for k, v in [("ntp", ntp_loss), ("mtp", mtp_loss), ("kl", kl_loss),
-                          ("simpo", spo["simpo_loss"])]:
+                          ("simpo", spo["simpo_loss"]), ("pair_acc", spo["pair_acc"])]:
                 accum[k] = accum.get(k, 0.0) + v.item()
+            for j in range(3):
+                accum[f"m{j+1}"] = accum.get(f"m{j+1}", 0.0) + spo["margins"][j].item()
+                accum[f"a{j+1}"] = accum.get(f"a{j+1}", 0.0) + spo["accs"][j].item()
+            for j in range(4):
+                accum[f"logp{j}"] = accum.get(f"logp{j}", 0.0) + spo["logp"][j].item()
             num_batches += 1
 
         self.model.train()
@@ -1941,10 +1906,11 @@ class SimPOTrainer(Trainer):
 
         self._log(
             f"  VAL: ntp={accum.get('ntp', 0):.4f} "
-            f"mtp={accum.get('mtp', 0):.4f} "
             f"simpo={accum.get('simpo', 0):.4f} "
-            f"margin={accum.get('margin', 0):.4f} "
-            f"acc={accum.get('acc', 0):.3f}"
+            f"pair_acc={accum.get('pair_acc', 0):.3f} | "
+            f"acc={accum.get('a1', 0):.3f}/{accum.get('a2', 0):.3f}/{accum.get('a3', 0):.3f} | "
+            f"m={accum.get('m1', 0):.3f}/{accum.get('m2', 0):.3f}/{accum.get('m3', 0):.3f} | "
+            f"logp={accum.get('logp0', 0):.2f}/{accum.get('logp1', 0):.2f}/{accum.get('logp2', 0):.2f}/{accum.get('logp3', 0):.2f}"
         )
         return result
 

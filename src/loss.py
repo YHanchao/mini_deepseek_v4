@@ -300,35 +300,35 @@ def logp_from_logits(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Ten
 
 
 def simpo_loss(
-    logits_winner: torch.Tensor,
-    logits_loser: torch.Tensor,
-    winner_ids: torch.Tensor,
-    loser_ids: torch.Tensor,
-    winner_mask: torch.Tensor,
-    loser_mask: torch.Tensor,
+    logits: torch.Tensor,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
     beta: float = 1.0,
     gamma: float = 0.1,
 ):
-    """Pure SimPO pairwise preference loss.
+    """SimPO loss: winner vs all 3 losers, vectorized.
 
-    L_SimPO = -log σ(β * (r_w - r_l) - γ)
+    Args:
+        logits: (bs, 4, seq_len, vocab)
+        ids:    (bs, 4, seq_len)   — already shifted by trainer
+        mask:   (bs, 4, seq_len)   — already shifted by trainer
+        beta:   SimPO temperature
+        gamma:  target margin
 
-    where r = Σ_masked(logp) / length for each response.
-
-    Returns dict with simpo_loss, margin, acc.
+    Returns:
+        dict with simpo_loss, pair_acc, margins(3,), accs(3,), logp(4,)
     """
-    logp_w = logp_from_logits(logits_winner, winner_ids) * winner_mask.float()
-    logp_l = logp_from_logits(logits_loser, loser_ids) * loser_mask.float()
+    logp = logp_from_logits(logits, ids) * mask.float()  # (bs, 4, seq_len)
+    length = mask.float().sum(dim=-1).clamp(min=1)
+    r = logp.sum(dim=-1) / length  # (bs, 4)  length-normalized scores
 
-    w_len = winner_mask.float().sum(dim=-1).clamp(min=1)
-    l_len = loser_mask.float().sum(dim=-1).clamp(min=1)
-    r_w = logp_w.sum(dim=-1) / w_len
-    r_l = logp_l.sum(dim=-1) / l_len
-
-    simpo = -torch.nn.functional.logsigmoid(beta * (r_w - r_l) - gamma)
+    diff = r[:, 0:1] - r[:, 1:4]  # (bs, 3)  winner minus each loser
+    losses = -torch.nn.functional.logsigmoid(beta * diff - gamma)  # (bs, 3)
 
     return {
-        "simpo_loss": simpo.mean(),
-        "margin": (r_w - r_l).mean(),
-        "acc": (r_w > r_l).float().mean(),
+        "simpo_loss": losses.mean(),
+        "pair_acc": (diff > 0).float().mean(),
+        "margins": diff.mean(dim=0),     # (3,)  per-pair average margin
+        "accs": (diff > 0).float().mean(dim=0),  # (3,)  per-pair accuracy
+        "logp": r.mean(dim=0),           # (4,)  avg logp for each position
     }
