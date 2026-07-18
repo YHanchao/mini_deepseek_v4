@@ -173,3 +173,53 @@ class SimPODataset(Dataset):
 
     def __getitem__(self, idx):
         return self.ids[idx], self.mask[idx]  # (4, seq_len), (4, seq_len)
+
+
+class WeightedSFTDataset(Dataset):
+    """Weighted SFT dataset: winner + 3 losers per group sorted by score.
+
+    Same data layout as SimPODataset, but additionally returns scores for
+    computing per-response importance weights.
+
+    Returns (ids, mask, scores) each of shape (4, seq_len) / (4, seq_len) / (4,):
+        [0] = winner, [1..3] = losers sorted by score descending.
+    """
+
+    def __init__(self, filepath: str):
+        data = torch.load(filepath)
+        ids = data["input_ids"]         # (4N, seq_len)
+        mask = data["completion_mask"]  # (4N, seq_len)
+        is_winner = data["is_winner"]   # (4N,)
+        scores = data["scores"].float().mean(dim=-1)  # (4N,)
+
+        n_groups = len(ids) // 4
+        ids = ids.reshape(n_groups, 4, -1).numpy()
+        mask = mask.reshape(n_groups, 4, -1).numpy()
+        winner = is_winner.reshape(n_groups, 4).numpy()
+        scores = scores.reshape(n_groups, 4).numpy()
+
+        self.ids = torch.empty(n_groups, 4, ids.shape[-1], dtype=torch.long, device="cpu")
+        self.mask = torch.empty(n_groups, 4, mask.shape[-1], dtype=torch.bool, device="cpu")
+        self.scores = torch.empty(n_groups, 4, dtype=torch.float, device="cpu")
+
+        for i in range(n_groups):
+            w = int(winner[i].nonzero()[0][0])
+            self.ids[i, 0] = torch.from_numpy(ids[i, w])
+            self.mask[i, 0] = torch.from_numpy(mask[i, w])
+            self.scores[i, 0] = float(scores[i, w])
+
+            loser_mask = ~winner[i]
+            loser_scores = scores[i][loser_mask]
+            order = loser_scores.argsort()[::-1]
+            loser_ids_arr = ids[i][loser_mask][order]
+            loser_masks_arr = mask[i][loser_mask][order]
+            for j in range(3):
+                self.ids[i, 1 + j] = torch.from_numpy(loser_ids_arr[j])
+                self.mask[i, 1 + j] = torch.from_numpy(loser_masks_arr[j])
+                self.scores[i, 1 + j] = float(loser_scores[order[j]])
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        return self.ids[idx], self.mask[idx], self.scores[idx]

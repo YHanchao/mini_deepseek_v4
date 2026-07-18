@@ -332,3 +332,86 @@ def simpo_loss(
         "accs": (diff > 0).float().mean(dim=0),  # (3,)  per-pair accuracy
         "logp": r.mean(dim=0),           # (4,)  avg logp for each position
     }
+
+
+def weighted_sft_loss(
+    logits_ntp: torch.Tensor,
+    logits_mtp: list,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    scores: torch.Tensor,
+):
+    """Weighted SFT: all 4 responses contribute, weighted by score / max_score.
+
+    Args:
+        logits_ntp: (bs, 4, seq-1, vocab) — NTP logits
+        logits_mtp: list of (bs*4, seq_i, vocab) — MTP logits per head
+        ids:        (bs, 4, seq_len)          — full token ids (unshifted)
+        mask:       (bs, 4, seq_len)          — 1 on response tokens
+        scores:     (bs, 4)                   — sorted [winner, loser1, loser2, loser3]
+
+    Returns:
+        dict with total_loss, ntp_loss, mtp_loss, and DPO-style monitoring metrics.
+    """
+    bs, gs = ids.shape[:2]
+
+    # ---- weights ----
+    w = scores / scores.max(dim=-1, keepdim=True).values  # (bs, 4), range (0, 1]
+
+    # ---- NTP weighted CE ----
+    logp_ntp = torch.log_softmax(logits_ntp, dim=-1)  # (bs, 4, seq-1, vocab)
+    nll_ntp = -logp_ntp.gather(dim=-1, index=ids[..., 1:].unsqueeze(-1)).squeeze(-1)  # (bs, 4, seq-1)
+    mask_ntp = mask[..., :-1].float()
+    w_ntp = w.unsqueeze(-1)  # (bs, 4, 1)
+    ntp_loss = (nll_ntp * mask_ntp * w_ntp).sum() / (mask_ntp * w_ntp).sum().clamp(min=1)
+
+    # ---- MTP weighted CE ----
+    mtp_loss = torch.tensor(0.0, device=ids.device)
+    for i, m in enumerate(logits_mtp):
+        m_r = m.reshape(bs, gs, -1, m.shape[-1])  # (bs, 4, seq_i, vocab)
+        offset = 1 + i + 1  # shift: 1 (ntp) + i (mtp head has already lost i tokens)
+        target = ids[..., offset:]  # (bs, 4, seq_len - offset)
+        m_r = m_r[:, :, : target.shape[-1]]  # align lengths
+        mask_mtp_i = mask[..., offset:].float()  # (bs, 4, seq_len - offset)
+
+        logp_m = torch.log_softmax(m_r, dim=-1)
+        nll_m = -logp_m.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+        mtp_loss = mtp_loss + (nll_m * mask_mtp_i * w_ntp).sum() / (mask_mtp_i * w_ntp).sum().clamp(min=1)
+
+    total_loss = ntp_loss + 0.3 * mtp_loss
+
+    # ---- Monitoring (no_grad) ----
+    with torch.no_grad():
+        # per-response length-normalized log prob
+        resp_len = mask_ntp.sum(dim=-1).clamp(min=1)  # (bs, 4)
+        logp_resp = (logp_ntp.gather(dim=-1, index=ids[..., 1:].unsqueeze(-1)).squeeze(-1)
+                     * mask_ntp).sum(dim=-1) / resp_len  # (bs, 4)
+
+        # 6 pairs + monitoring (same as DPO)
+        idx_i, idx_j = torch.triu_indices(gs, gs, offset=1, device=ids.device).unbind()
+        lp_i = logp_resp[:, idx_i]
+        lp_j = logp_resp[:, idx_j]
+
+        # chosen = higher score
+        si = scores[:, idx_i]
+        sj = scores[:, idx_j]
+        pref_mask = si > sj
+        tie_mask = si == sj
+
+        chosen_lp = torch.where(pref_mask, lp_i, lp_j)
+        rejected_lp = torch.where(pref_mask, lp_j, lp_i)
+        raw_margin = chosen_lp - rejected_lp
+
+        valid = ~tie_mask
+        vc = valid.sum().clamp(min=1)
+
+    return {
+        "total_loss": total_loss,
+        "ntp_loss": ntp_loss,
+        "mtp_loss": mtp_loss,
+        "pair_acc": ((raw_margin > 0) & valid).float().sum() / vc,
+        "raw_margin_mean": (raw_margin * valid).sum() / vc,
+        "chosen_lr_mean": (chosen_lp * valid).sum() / vc,
+        "rejected_lr_mean": (rejected_lp * valid).sum() / vc,
+        "logp": logp_resp,  # (bs, 4)
+    }

@@ -22,11 +22,13 @@ from src.dataset import (
     GRPOOffPolicyDataset,
     DPODataset,
     SimPODataset,
+    WeightedSFTDataset,
 )
 from src.loss import (
     cross_entropy,
     indexer_kl_loss,
     cross_entropy_masked,
+    weighted_sft_loss,
     grpo_loss,
     dpo_loss,
     simpo_loss,
@@ -177,6 +179,21 @@ class SimPOTrainerArgs(TrainerArgs):
     num_workers: int = 0
 
 
+@dataclass
+class WeightedSFTTrainerArgs(TrainerArgs):
+    config_name: str = "small"
+    base_model_path: str = ""
+
+    data_train: str = ""
+    data_val: str = ""
+
+    lr: float = 2.7e-4
+    lr_min: float = 2.7e-5
+    warmup_steps: int = 2000
+
+    num_workers: int = 0
+
+
 # ======================================================================
 # Trainer
 # ======================================================================
@@ -309,9 +326,7 @@ class Trainer:
         tok_per_sec = tokens_this_step / step_time if step_time > 0 else 0
         mem_mb = torch.cuda.max_memory_allocated(self.local_rank) / 1024**2
 
-        metrics_str = " | ".join(
-            f"{k}: {v:.4f}" for k, v in sorted(losses.items())
-        )
+        metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(losses.items()))
         self._log(
             f"Step {step:>6d}/{self.total_steps} | "
             f"{metrics_str} | "
@@ -1736,12 +1751,19 @@ class SimPOTrainer(Trainer):
         train_sampler = None
         if self.world_size > 1:
             train_sampler = DistributedSampler(
-                train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False,
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False,
             )
         self.train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, shuffle=False,
-            sampler=train_sampler, num_workers=self.num_workers,
-            pin_memory=True, drop_last=True,
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
         )
 
         if self.data_val:
@@ -1749,12 +1771,19 @@ class SimPOTrainer(Trainer):
             val_sampler = None
             if self.world_size > 1:
                 val_sampler = DistributedSampler(
-                    val_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False,
+                    val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=False,
                 )
             self.val_loader = DataLoader(
-                val_dataset, batch_size=self.batch_size, shuffle=False,
-                sampler=val_sampler, num_workers=self.num_workers,
-                pin_memory=True, drop_last=False,
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
             )
         else:
             self.val_loader = None
@@ -1787,9 +1816,9 @@ class SimPOTrainer(Trainer):
         # MTP on winner: each head produces (bs*4, seq-1, vocab), take winner slice
         mtp_loss = sum(
             cross_entropy_masked(
-                ids[:, 0, i + 2:],
-                m.reshape(bs, 4, -1, m.shape[-1])[:, 0, :-(1 + i)],
-                mask[:, 0, :-(i + 2)],
+                ids[:, 0, i + 2 :],
+                m.reshape(bs, 4, -1, m.shape[-1])[:, 0, : -(1 + i)],
+                mask[:, 0, : -(i + 2)],
             )
             for i, m in enumerate(mtp_list)
         )
@@ -1808,7 +1837,9 @@ class SimPOTrainer(Trainer):
         )
 
         lm_loss = ntp_loss + 0.3 * mtp_loss
-        total_loss = (lm_loss + 0.5 * kl_loss + self.lambda_simpo * spo["simpo_loss"]) / self.grad_accum
+        total_loss = (
+            lm_loss + 0.5 * kl_loss + self.lambda_simpo * spo["simpo_loss"]
+        ) / self.grad_accum
 
         if self.world_size > 1 and not is_last_micro:
             with self.model.no_sync():
@@ -1823,8 +1854,12 @@ class SimPOTrainer(Trainer):
             "kl": kl_loss.item(),
             "simpo": spo["simpo_loss"].item(),
             "pair_acc": spo["pair_acc"].item(),
-            "m1": spo["margins"][0].item(), "m2": spo["margins"][1].item(), "m3": spo["margins"][2].item(),
-            "a1": spo["accs"][0].item(), "a2": spo["accs"][1].item(), "a3": spo["accs"][2].item(),
+            "m1": spo["margins"][0].item(),
+            "m2": spo["margins"][1].item(),
+            "m3": spo["margins"][2].item(),
+            "a1": spo["accs"][0].item(),
+            "a2": spo["accs"][1].item(),
+            "a3": spo["accs"][2].item(),
         }
 
     @torch.no_grad()
@@ -1856,15 +1891,14 @@ class SimPOTrainer(Trainer):
             ntp_loss = cross_entropy_masked(ids[:, 0, 1:], ntp[:, 0], mask[:, 0, :-1])
             mtp_loss = sum(
                 cross_entropy_masked(
-                    ids[:, 0, i + 2:],
-                    m.reshape(bs, 4, -1, m.shape[-1])[:, 0, :-(1 + i)],
-                    mask[:, 0, :-(i + 2)],
+                    ids[:, 0, i + 2 :],
+                    m.reshape(bs, 4, -1, m.shape[-1])[:, 0, : -(1 + i)],
+                    mask[:, 0, : -(i + 2)],
                 )
                 for i, m in enumerate(mtp_list)
             )
             kl_loss = sum(
-                indexer_kl_loss(iscore, idx, wc)
-                for (iscore, wc, idx) in idx_data
+                indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
             )
 
             spo = simpo_loss(
@@ -1875,8 +1909,13 @@ class SimPOTrainer(Trainer):
                 gamma=self.gamma,
             )
 
-            for k, v in [("ntp", ntp_loss), ("mtp", mtp_loss), ("kl", kl_loss),
-                          ("simpo", spo["simpo_loss"]), ("pair_acc", spo["pair_acc"])]:
+            for k, v in [
+                ("ntp", ntp_loss),
+                ("mtp", mtp_loss),
+                ("kl", kl_loss),
+                ("simpo", spo["simpo_loss"]),
+                ("pair_acc", spo["pair_acc"]),
+            ]:
                 accum[k] = accum.get(k, 0.0) + v.item()
             for j in range(3):
                 accum[f"m{j+1}"] = accum.get(f"m{j+1}", 0.0) + spo["margins"][j].item()
@@ -1910,6 +1949,275 @@ class SimPOTrainer(Trainer):
             f"pair_acc={accum.get('pair_acc', 0):.3f} | "
             f"acc={accum.get('a1', 0):.3f}/{accum.get('a2', 0):.3f}/{accum.get('a3', 0):.3f} | "
             f"m={accum.get('m1', 0):.3f}/{accum.get('m2', 0):.3f}/{accum.get('m3', 0):.3f} | "
+            f"logp={accum.get('logp0', 0):.2f}/{accum.get('logp1', 0):.2f}/{accum.get('logp2', 0):.2f}/{accum.get('logp3', 0):.2f}"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # LR schedule
+    # ------------------------------------------------------------------
+
+    def get_lr(self, step: int) -> float:
+        return cosine_annealing_lr_schedule(
+            step, self.lr, self.lr_min, self.warmup_steps, self.total_steps
+        )
+
+    # ------------------------------------------------------------------
+    # Optimizer step
+    # ------------------------------------------------------------------
+
+    def _optimizer_step(self) -> float:
+        gn = grad_clip(self.model.parameters(), self.max_grad_norm)
+        for opt in self.optimizers:
+            opt.step()
+        self.model.zero_grad()
+        return gn
+
+
+class WeightedSFTTrainer(Trainer):
+
+    def __init__(self, args: WeightedSFTTrainerArgs):
+        super().__init__(args)
+        self._model_args: Optional[DSArgs] = None
+        self.base_model_ckpt_path = args.base_model_path
+
+    def build_model_and_optimizers(self):
+        cfg = MODEL_CONFIGS[self.config_name].copy()
+        cfg["max_seq_len"] = self.max_seq_len
+        self.max_seq_len = cfg["max_seq_len"]
+
+        base_fields = DSArgs.__dataclass_fields__
+        args = DSArgs(**{k: v for k, v in cfg.items() if k in base_fields})
+
+        needed = args.n_layer + args.n_mtp_layer
+        if len(args.compress_ratios) < needed:
+            args.compress_ratios = args.compress_ratios + tuple(
+                [0] * (needed - len(args.compress_ratios))
+            )
+
+        self._model_args = args
+
+        model = DeepSeekV4(args)
+        model.train()
+        model = model.to(self.local_rank)
+
+        ckpt = torch.load(
+            self.base_model_ckpt_path,
+            map_location=f"cuda:{self.local_rank}",
+            weights_only=False,
+        )
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        muon_p, adamw_p = group_params(model)
+        idx_p = get_indexer_params(model)
+
+        muon_opt = Muon(muon_p, lr=self.lr, momentum=0.95, weight_decay=0.1)
+        adamw_opt = AdamW(adamw_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+        idx_opt = AdamW(idx_p, lr=self.lr, betas=(0.9, 0.95), weight_decay=0.1)
+
+        self.optimizers = [muon_opt, adamw_opt, idx_opt]
+
+        if self.world_size > 1:
+            self.model = DDP(
+                model, device_ids=[self.local_rank], find_unused_parameters=True
+            )
+        else:
+            self.model = model
+
+        if self.is_main:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            self._log(
+                f"Model: {self.config_name} | "
+                f"Params: {total_params/1e6:.1f}M total, {trainable/1e6:.1f}M trainable | "
+                f"d_model={args.d_model}, n_layer={args.n_layer}, "
+                f"n_experts={args.n_experts}, seq_len={args.max_seq_len}"
+            )
+
+    def build_dataloaders(self):
+        if not self.data_train:
+            raise ValueError("--data-train is required")
+
+        train_dataset = WeightedSFTDataset(self.data_train)
+        train_sampler = None
+        if self.world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False,
+            )
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        if self.data_val:
+            val_dataset = WeightedSFTDataset(self.data_val)
+            val_sampler = None
+            if self.world_size > 1:
+                val_sampler = DistributedSampler(
+                    val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    shuffle=False,
+                )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+        else:
+            self.val_loader = None
+
+        if self.is_main:
+            self._log(
+                f"Train data: {self.data_train} | "
+                f"{len(train_dataset):,} samples | "
+                f"batch={self.batch_size}, seq_len={self.max_seq_len}"
+            )
+            if self.val_loader:
+                self._log(f"Val data: {self.data_val} | {len(val_dataset):,} samples")
+
+    def train_step(self, batch, is_last_micro):
+        ids, mask, scores = batch  # each (bs, 4, seq_len) / (bs, 4, seq_len) / (bs, 4)
+        bs = ids.shape[0]
+
+        # Forward: all 4 candidates together
+        all_ids = ids.reshape(bs * 4, -1)
+        all_ids = all_ids.to(self.local_rank, non_blocking=True)
+
+        ntp, mtp_list, idx_data = self.model(all_ids[..., :-1].contiguous())
+        ntp = ntp.reshape(bs, 4, -1, ntp.shape[-1])  # (bs, 4, seq-1, vocab)
+
+        ids = ids.to(self.local_rank, non_blocking=True)
+        mask = mask.to(self.local_rank, non_blocking=True)
+        scores = scores.to(self.local_rank, non_blocking=True)
+
+        # ---- Weighted SFT on all 4 responses ----
+        wsft = weighted_sft_loss(
+            logits_ntp=ntp,
+            logits_mtp=mtp_list,
+            ids=ids,
+            mask=mask,
+            scores=scores,
+        )
+        kl_loss = sum(
+            indexer_kl_loss(iscore, idx, wc.detach() if wc is not None else None)
+            for (iscore, wc, idx) in idx_data
+        )
+
+        total_loss = (wsft["total_loss"] + 0.5 * kl_loss) / self.grad_accum
+
+        if self.world_size > 1 and not is_last_micro:
+            with self.model.no_sync():
+                total_loss.backward()
+        else:
+            total_loss.backward()
+
+        return {
+            "ntp": wsft["ntp_loss"].item(),
+            "mtp": wsft["mtp_loss"].item(),
+            "kl": kl_loss.item(),
+            "lm": wsft["total_loss"].item(),
+            "pair_acc": wsft["pair_acc"].item(),
+            "margin_raw": wsft["raw_margin_mean"].item(),
+            "chosen_lp": wsft["chosen_lr_mean"].item(),
+            "rejected_lp": wsft["rejected_lr_mean"].item(),
+        }
+
+    @torch.no_grad()
+    def validate(self, max_val_batches: int = 100) -> Dict[str, float]:
+        if not self.val_loader:
+            return {}
+
+        self.model.eval()
+
+        accum: Dict[str, float] = {}
+        num_batches = 0
+
+        for batch in self.val_loader:
+            if num_batches >= max_val_batches:
+                break
+
+            ids, mask, scores = batch  # (bs, 4, seq_len) / (bs, 4, seq_len) / (bs, 4)
+            bs = ids.shape[0]
+
+            all_ids = ids.reshape(bs * 4, -1)
+            all_ids = all_ids.to(self.local_rank, non_blocking=True)
+
+            ntp, mtp_list, idx_data = self.model(all_ids[..., :-1].contiguous())
+            ntp = ntp.reshape(bs, 4, -1, ntp.shape[-1])
+
+            ids = ids.to(self.local_rank, non_blocking=True)
+            mask = mask.to(self.local_rank, non_blocking=True)
+            scores = scores.to(self.local_rank, non_blocking=True)
+
+            wsft = weighted_sft_loss(
+                logits_ntp=ntp,
+                logits_mtp=mtp_list,
+                ids=ids,
+                mask=mask,
+                scores=scores,
+            )
+            kl_loss = sum(
+                indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
+            )
+
+            for k in ["ntp_loss", "mtp_loss", "total_loss",
+                       "pair_acc", "raw_margin_mean", "chosen_lr_mean", "rejected_lr_mean"]:
+                accum[k] = accum.get(k, 0.0) + wsft[k].item()
+            accum["kl"] = accum.get("kl", 0.0) + kl_loss.item()
+
+            # per-response log probs for ranking
+            logp = wsft["logp"]  # (bs, 4)
+            pred = logp.argmax(dim=-1)
+            gt = scores.argmax(dim=-1)
+            top1 = (pred == gt).float().mean()
+            accum["top1"] = accum.get("top1", 0.0) + top1.item()
+            for j in range(4):
+                accum[f"logp{j}"] = accum.get(f"logp{j}", 0.0) + logp[:, j].mean().item()
+            num_batches += 1
+
+        self.model.train()
+
+        for k in accum:
+            accum[k] /= num_batches
+
+        if self.world_size > 1:
+            keys = sorted(accum.keys())
+            vals = [accum[k] for k in keys]
+            t = torch.tensor(vals, device=self.local_rank)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t /= self.world_size
+            for k, v in zip(keys, t.tolist()):
+                accum[k] = v
+
+        lm = accum.get("ntp_loss", 0) + 0.3 * accum.get("mtp_loss", 0)
+        result = {f"val/{k}": v for k, v in accum.items()}
+        result["val/lm_loss"] = lm
+        result["val/ntp_loss"] = accum.get("ntp_loss", 0)
+
+        self._log(
+            f"  VAL: ntp={accum.get('ntp_loss', 0):.4f} "
+            f"mtp={accum.get('mtp_loss', 0):.4f} "
+            f"kl={accum.get('kl', 0):.4f} | "
+            f"top1={accum.get('top1', 0):.3f} "
+            f"pair_acc={accum.get('pair_acc', 0):.3f} "
+            f"margin={accum.get('raw_margin_mean', 0):.4f} | "
+            f"chosen_lp={accum.get('chosen_lr_mean', 0):.3f} "
+            f"rejected_lp={accum.get('rejected_lr_mean', 0):.3f} | "
             f"logp={accum.get('logp0', 0):.2f}/{accum.get('logp1', 0):.2f}/{accum.get('logp2', 0):.2f}/{accum.get('logp3', 0):.2f}"
         )
         return result
