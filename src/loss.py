@@ -340,38 +340,27 @@ def weighted_sft_loss(
     ids: torch.Tensor,
     mask: torch.Tensor,
     scores: torch.Tensor,
-    uniform: bool = False,
+    weight_min: float = 1.0,
+    weight_max: float = 1.0,
 ):
-    """Weighted SFT: all 4 responses contribute, weighted by score / max_score.
+    """Weighted SFT: linear weight map across [weight_min, weight_max] per group.
 
-    Args:
-        logits_ntp: (bs, 4, seq-1, vocab) — NTP logits
-        logits_mtp: list of (bs*4, seq_i, vocab) — MTP logits per head
-        ids:        (bs, 4, seq_len)          — full token ids (unshifted)
-        mask:       (bs, 4, seq_len)          — 1 on response tokens
-        scores:     (bs, 4)                   — sorted [winner, loser1, loser2, loser3]
-
-    Returns:
-        dict with total_loss, ntp_loss, mtp_loss, and DPO-style monitoring metrics.
+    Winner → weight_max, loser → weight_min.  Negative weights act as a penalty
+    (reversed gradient) on low-score responses.
     """
     bs, gs = ids.shape[:2]
 
-    # ---- weights ----
-    if uniform:
-        w = torch.ones_like(scores)  # all equal
-    else:
-        # linear map to [0.1, 1.0]
-        s_min = scores.min(dim=-1, keepdim=True).values
-        s_max = scores.max(dim=-1, keepdim=True).values
-        s_range = (s_max - s_min).clamp(min=1e-8)
-        w = 0.1 + 0.9 * (scores - s_min) / s_range  # (bs, 4)
+    s_min = scores.min(dim=-1, keepdim=True).values
+    s_max = scores.max(dim=-1, keepdim=True).values
+    s_range = (s_max - s_min).clamp(min=1e-8)
+    w = weight_min + (weight_max - weight_min) * (scores - s_min) / s_range  # (bs, 4)
 
     # ---- NTP weighted CE ----
-    logp_ntp = torch.log_softmax(logits_ntp, dim=-1)  # (bs, 4, seq-1, vocab)
-    nll_ntp = -logp_ntp.gather(dim=-1, index=ids[..., 1:].unsqueeze(-1)).squeeze(-1)  # (bs, 4, seq-1)
+    logp_ntp = torch.log_softmax(logits_ntp, dim=-1)
+    nll_ntp = -logp_ntp.gather(dim=-1, index=ids[..., 1:].unsqueeze(-1)).squeeze(-1)
     mask_ntp = mask[..., :-1].float()
-    w_ntp = w.unsqueeze(-1)  # (bs, 4, 1)
-    ntp_loss = (nll_ntp * mask_ntp * w_ntp).sum() / (mask_ntp * w_ntp).sum().clamp(min=1)
+    w_ntp = w.unsqueeze(-1)
+    ntp_loss = (nll_ntp * mask_ntp * w_ntp).sum() / (mask_ntp * w_ntp.abs()).sum().clamp(min=1)
 
     # ---- MTP weighted CE ----
     mtp_loss = torch.tensor(0.0, device=ids.device)
@@ -384,7 +373,7 @@ def weighted_sft_loss(
 
         logp_m = torch.log_softmax(m_r, dim=-1)
         nll_m = -logp_m.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
-        mtp_loss = mtp_loss + (nll_m * mask_mtp_i * w_ntp).sum() / (mask_mtp_i * w_ntp).sum().clamp(min=1)
+        mtp_loss = mtp_loss + (nll_m * mask_mtp_i * w_ntp).sum() / (mask_mtp_i * w_ntp.abs()).sum().clamp(min=1)
 
     total_loss = ntp_loss + 0.3 * mtp_loss
 
