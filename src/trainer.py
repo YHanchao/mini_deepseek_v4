@@ -1987,6 +1987,23 @@ class WeightedSFTTrainer(Trainer):
         self.base_model_ckpt_path = args.base_model_path
         self.weight_min = args.weight_min_start  # init before first train_step
 
+    def load_checkpoint(self, path: str, resume_step: bool = True) -> Tuple[int, Dict]:
+        state = torch.load(
+            path, map_location=f"cuda:{self.local_rank}", weights_only=False
+        )
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        model.load_state_dict(state["model_state_dict"])
+
+        for opt, sd in zip(self.optimizers, state["optimizers_state_dict"]):
+            opt.load_state_dict(sd)
+        torch.set_rng_state(state["torch_rng_state"].cpu())
+
+        if state.get("cuda_rng_state") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
+        extra = state.get("extra", {})
+
+        return 0, {}
+
     def build_model_and_optimizers(self):
         cfg = MODEL_CONFIGS[self.config_name].copy()
         cfg["max_seq_len"] = self.max_seq_len
