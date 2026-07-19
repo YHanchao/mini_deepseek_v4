@@ -1,4 +1,5 @@
 import gc
+import math
 import os
 import time
 import datetime
@@ -2141,6 +2142,7 @@ class WeightedSFTTrainer(Trainer):
             "margin_raw": wsft["raw_margin_mean"].item(),
             "chosen_lp": wsft["chosen_lr_mean"].item(),
             "rejected_lp": wsft["rejected_lr_mean"].item(),
+            "w_min": self.weight_min,
         }
 
     @torch.no_grad()
@@ -2241,7 +2243,8 @@ class WeightedSFTTrainer(Trainer):
 
     def get_weight_min(self, step: int) -> float:
         progress = min(step / self.total_steps, 1.0)
-        return self.weight_min_start + (self.weight_min_end - self.weight_min_start) * progress
+        cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1.0 → 0.0
+        return self.weight_min_end + (self.weight_min_start - self.weight_min_end) * cos_val
 
     def _set_weight_min(self, step: int):
         self.weight_min = self.get_weight_min(step)
