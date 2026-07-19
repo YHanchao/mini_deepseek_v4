@@ -190,6 +190,8 @@ class WeightedSFTTrainerArgs(TrainerArgs):
     lr: float = 2.7e-4
     lr_min: float = 2.7e-5
     warmup_steps: int = 2000
+    weight_min_start: float = 0.7
+    weight_min_end: float = 0.2
 
     num_workers: int = 0
 
@@ -1980,6 +1982,7 @@ class WeightedSFTTrainer(Trainer):
         super().__init__(args)
         self._model_args: Optional[DSArgs] = None
         self.base_model_ckpt_path = args.base_model_path
+        self.weight_min = args.weight_min_start  # init before first train_step
 
     def build_model_and_optimizers(self):
         cfg = MODEL_CONFIGS[self.config_name].copy()
@@ -2106,13 +2109,14 @@ class WeightedSFTTrainer(Trainer):
         scores = scores.to(self.local_rank, non_blocking=True)
 
         # ---- Weighted SFT on all 4 responses ----
+        self._set_weight_min(self._current_step)
         wsft = weighted_sft_loss(
             logits_ntp=ntp,
             logits_mtp=mtp_list,
             ids=ids,
             mask=mask,
             scores=scores,
-            weight_min=-1.0,
+            weight_min=self.weight_min,
             weight_max=1.0,
         )
         kl_loss = sum(
@@ -2172,7 +2176,7 @@ class WeightedSFTTrainer(Trainer):
                 ids=ids,
                 mask=mask,
                 scores=scores,
-                weight_min=-1.0,
+                weight_min=self.weight_min,
                 weight_max=1.0,
             )
             kl_loss = sum(
@@ -2234,6 +2238,13 @@ class WeightedSFTTrainer(Trainer):
         return cosine_annealing_lr_schedule(
             step, self.lr, self.lr_min, self.warmup_steps, self.total_steps
         )
+
+    def get_weight_min(self, step: int) -> float:
+        progress = min(step / self.total_steps, 1.0)
+        return self.weight_min_start + (self.weight_min_end - self.weight_min_start) * progress
+
+    def _set_weight_min(self, step: int):
+        self.weight_min = self.get_weight_min(step)
 
     # ------------------------------------------------------------------
     # Optimizer step
