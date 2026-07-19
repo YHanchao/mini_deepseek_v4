@@ -196,6 +196,8 @@ class WeightedSFTTrainerArgs(TrainerArgs):
 
     num_workers: int = 0
 
+    resume_step: bool = False
+
 
 # ======================================================================
 # Trainer
@@ -271,7 +273,7 @@ class Trainer:
         if self.world_size > 1:
             dist.barrier()
 
-    def load_checkpoint(self, path: str) -> Tuple[int, Dict]:
+    def load_checkpoint(self, path: str, resume_step: bool = True) -> Tuple[int, Dict]:
         state = torch.load(
             path, map_location=f"cuda:{self.local_rank}", weights_only=False
         )
@@ -286,7 +288,7 @@ class Trainer:
             torch.cuda.set_rng_state(state["cuda_rng_state"].cpu())
         extra = state.get("extra", {})
 
-        if self.resume_step:
+        if resume_step:
             return state["step"] + 1, extra
         else:
             return 0, {}
@@ -424,7 +426,7 @@ class Trainer:
         self._init_wandb()
 
         if self.resume:
-            self.start_step, extra = self.load_checkpoint(self.resume)
+            self.start_step, extra = self.load_checkpoint(self.resume, self.resume_step)
             self.best_val_loss = extra.get("best_val_loss", float("inf"))
             if self.is_main:
                 self._log(
@@ -2185,8 +2187,15 @@ class WeightedSFTTrainer(Trainer):
                 indexer_kl_loss(iscore, idx, wc) for (iscore, wc, idx) in idx_data
             )
 
-            for k in ["ntp_loss", "mtp_loss", "total_loss",
-                       "pair_acc", "raw_margin_mean", "chosen_lr_mean", "rejected_lr_mean"]:
+            for k in [
+                "ntp_loss",
+                "mtp_loss",
+                "total_loss",
+                "pair_acc",
+                "raw_margin_mean",
+                "chosen_lr_mean",
+                "rejected_lr_mean",
+            ]:
                 accum[k] = accum.get(k, 0.0) + wsft[k].item()
             accum["kl"] = accum.get("kl", 0.0) + kl_loss.item()
 
@@ -2197,7 +2206,9 @@ class WeightedSFTTrainer(Trainer):
             top1 = (pred == gt).float().mean()
             accum["top1"] = accum.get("top1", 0.0) + top1.item()
             for j in range(4):
-                accum[f"logp{j}"] = accum.get(f"logp{j}", 0.0) + logp[:, j].mean().item()
+                accum[f"logp{j}"] = (
+                    accum.get(f"logp{j}", 0.0) + logp[:, j].mean().item()
+                )
             num_batches += 1
 
         self.model.train()
@@ -2244,7 +2255,10 @@ class WeightedSFTTrainer(Trainer):
     def get_weight_min(self, step: int) -> float:
         progress = min(step / self.total_steps, 1.0)
         cos_val = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1.0 → 0.0
-        return self.weight_min_end + (self.weight_min_start - self.weight_min_end) * cos_val
+        return (
+            self.weight_min_end
+            + (self.weight_min_start - self.weight_min_end) * cos_val
+        )
 
     def _set_weight_min(self, step: int):
         self.weight_min = self.get_weight_min(step)
