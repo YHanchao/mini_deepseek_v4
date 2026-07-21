@@ -1,0 +1,14 @@
+# Core dependencies
+torch>=2.4.0
+numpy
+regex
+psutil
+
+# Optional: training logging
+wandb
+
+# Optional: data preparation & visualization
+matplotlib
+pandas
+pyarrow
+requests
